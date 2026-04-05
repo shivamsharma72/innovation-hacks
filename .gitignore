@@ -1,0 +1,48 @@
+.DS_Store
+*.db
+*.log
+
+# Env & secrets (keep *.example)
+.env
+.env.local
+.env.*.local
+!.env.example
+!.env*.example
+
+# Google Cloud OAuth client downloads — never commit
+client_secret*.json
+**/client_secret*.json
+
+# Node
+node_modules/
+**/node_modules/
+
+# Next.js
+.next/
+out/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+**/venv/
+apps/gateway/.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Gateway local DB
+apps/gateway/gateway.db
+
+# Workspace MCP OAuth store (local)
+google_workspace_mcp/store_creds_local/
+**/store_creds*/
+
+# IDE
+.idea/
+.vscode/
+*.swp

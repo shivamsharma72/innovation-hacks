@@ -1,0 +1,75 @@
+# Local deploy: gateway + Canvas MCP + Google Workspace MCP (streamable HTTP).
+# Register http://localhost:8002/oauth2callback in Google Cloud for Workspace MCP OAuth.
+#
+# Logs (health checks are noisy by default):
+#   docker compose logs -f gateway 2>&1 | grep -v 'GET /health'
+#   docker compose logs -f gateway 2>&1 | grep -E 'agent tool_call|POST /chat'
+#   docker compose logs -f workspace-mcp canvas-mcp 2>&1 | grep -v '/health'
+# Canvas MCP is the Python server in ./canvas-mcp (FastMCP + uvicorn).
+# MCP JSON-RPC hits the gateway from inside Docker; tool names appear on gateway as "agent tool_call".
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gateway
+    ports:
+      - "8000:8000"
+    env_file:
+      - apps/gateway/.env
+    environment:
+      MCP_CANVAS_URL: http://canvas-mcp:3000/mcp
+      MCP_GOOGLE_WORKSPACE_URL: http://workspace-mcp:8000/mcp
+      MCP_WORKSPACE_BROWSER_URL: http://localhost:8002
+    depends_on:
+      - canvas-mcp
+      - workspace-mcp
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
+      interval: 90s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # Python canvas-mcp: gateway sends X-Canvas-Token / X-Canvas-URL per chat (user onboarding).
+  canvas-mcp:
+    build:
+      context: ./canvas-mcp
+      dockerfile: Dockerfile
+    environment:
+      ENABLE_DATA_ANONYMIZATION: "false"
+    ports:
+      - "3001:3000"
+
+  # OAuth: set GOOGLE_OAUTH_CLIENT_ID / SECRET in apps/gateway/.env (same as GOOGLE_CLIENT_* is fine).
+  workspace-mcp:
+    build:
+      context: ./google_workspace_mcp
+      dockerfile: Dockerfile
+    env_file:
+      - apps/gateway/.env
+    ports:
+      - "8002:8000"
+    environment:
+      PORT: "8000"
+      # Gateway opens a new MCP streamable-HTTP session per chat. OAuth 2.1 mode ties
+      # tokens to a single MCP session, so Gmail/Calendar tools fail with "Access denied"
+      # after browser OAuth. Legacy mode + on-disk creds + optional USER_GOOGLE_EMAIL works.
+      MCP_ENABLE_OAUTH21: "false"
+      WORKSPACE_MCP_STATELESS_MODE: "false"
+      WORKSPACE_MCP_BASE_URI: http://localhost
+      WORKSPACE_EXTERNAL_URL: http://localhost:8002
+      GOOGLE_OAUTH_REDIRECT_URI: http://localhost:8002/oauth2callback
+      WORKSPACE_MCP_CREDENTIALS_DIR: /app/store_creds
+      OAUTHLIB_INSECURE_TRANSPORT: "1"
+    volumes:
+      - workspace_mcp_creds:/app/store_creds
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
+      interval: 90s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  workspace_mcp_creds:

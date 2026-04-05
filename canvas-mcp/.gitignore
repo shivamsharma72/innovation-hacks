@@ -1,0 +1,75 @@
+# Python files to ignore
+# Uncomment the following lines if you want to ignore specific Python files
+# some_specific_file.py
+# temp_*.py
+
+# Python virtual environment
+venv/
+fresh_venv/
+.venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Environment variables
+.env
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+.cursorrules
+
+# macOS specific files
+.DS_Store
+
+# Logs
+*.log
+
+# Documentation folder
+documents/
+
+# Development tools and files
+extract_canvas_api_docs.py
+canvas_api_docs/
+get_course_grades.py
+gradebook.json
+# Student data and utility scripts
+student_anonymization_mapping.txt
+show_student_mappings.py
+/_**
+.aider*
+/test_*.py
+!tests/
+
+# Local de-anonymization maps (contains PII)
+local_maps/
+docs/hybrid_builder_launch.md
+
+# Internal planning/tracking files
+CLEANUP.md
+CLEANUP_STATE.json
+cleanup/
+
+# Archive directory - old structure and development files
+archive/
+node_modules/
+
+# Smithery build artifacts
+.smithery/
+smithery-wrapper/node_modules/
+smithery-wrapper/.smithery/
+.mcp.json

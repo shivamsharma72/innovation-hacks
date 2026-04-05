@@ -1,0 +1,93 @@
+{
+  "collected_at": "2026-03-23T14:00:08Z",
+  "github": {
+    "stars": 81,
+    "forks": 31,
+    "contributors": 9,
+    "open_issues": 1,
+    "views_14d": 1202,
+    "views_14d_unique": 498,
+    "clones_14d": 831,
+    "clones_14d_unique": 375,
+    "referrers": [
+      {
+        "referrer": "Google",
+        "count": 648,
+        "uniques": 342
+      },
+      {
+        "referrer": "github.com",
+        "count": 117,
+        "uniques": 41
+      },
+      {
+        "referrer": "canvas-mcp.illinihunt.org",
+        "count": 47,
+        "uniques": 16
+      },
+      {
+        "referrer": "search.brave.com",
+        "count": 43,
+        "uniques": 13
+      },
+      {
+        "referrer": "Bing",
+        "count": 24,
+        "uniques": 16
+      },
+      {
+        "referrer": "DuckDuckGo",
+        "count": 9,
+        "uniques": 4
+      },
+      {
+        "referrer": "perplexity.ai",
+        "count": 8,
+        "uniques": 5
+      },
+      {
+        "referrer": "linkedin.com",
+        "count": 8,
+        "uniques": 4
+      },
+      {
+        "referrer": "mcpservers.org",
+        "count": 6,
+        "uniques": 2
+      },
+      {
+        "referrer": "chatgpt.com",
+        "count": 5,
+        "uniques": 4
+      }
+    ]
+  },
+  "pypi": {
+    "last_day": 4,
+    "last_week": 108,
+    "last_month": 502
+  },
+  "npm": {
+    "last_month": 113
+  },
+  "history": [
+    {
+      "date": "2026-03-20",
+      "stars": 81,
+      "forks": 30,
+      "pypi_month": 521,
+      "npm_month": 107,
+      "views_unique": 509,
+      "clones_unique": 362
+    },
+    {
+      "date": "2026-03-23",
+      "stars": 81,
+      "forks": 31,
+      "pypi_month": 502,
+      "npm_month": 113,
+      "views_unique": 498,
+      "clones_unique": 375
+    }
+  ]
+}
