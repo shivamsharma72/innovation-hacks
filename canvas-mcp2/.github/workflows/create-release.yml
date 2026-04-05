@@ -1,0 +1,96 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name (e.g., v1.0.7)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: create-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG_NAME="${{ inputs.tag_name }}"
+          else
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+          fi
+          VERSION=${TAG_NAME#v}
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Tag: $TAG_NAME, Version: $VERSION"
+
+      - name: Get current date
+        id: date
+        run: |
+          RELEASE_DATE=$(date -u +"%B %d, %Y")
+          echo "release_date=$RELEASE_DATE" >> $GITHUB_OUTPUT
+          echo "Release date: $RELEASE_DATE"
+
+      - name: Extract release notes from commits
+        id: notes
+        run: |
+          TAG_NAME="${{ steps.version.outputs.tag_name }}"
+          
+          # Get commits since last tag (more reliable method)
+          LAST_TAG=$(git tag --sort=-v:refname | grep -v "^$TAG_NAME$" | head -n1)
+          if [ -z "$LAST_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"- %s" --no-merges)
+          else
+            COMMITS=$(git log ${LAST_TAG}..HEAD --pretty=format:"- %s" --no-merges)
+          fi
+          
+          # Save to file for multi-line content
+          echo "$COMMITS" > release_notes.txt
+          echo "Release notes extracted"
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${{ steps.version.outputs.tag_name }}"
+          RELEASE_DATE="${{ steps.date.outputs.release_date }}"
+          
+          # Create release body
+          echo "## What's New in ${TAG_NAME}" > release_body.md
+          echo "" >> release_body.md
+          echo "### Changes" >> release_body.md
+          cat release_notes.txt >> release_body.md
+          echo "" >> release_body.md
+          echo "---" >> release_body.md
+          echo "" >> release_body.md
+          echo "**Released:** ${RELEASE_DATE}" >> release_body.md
+          echo "" >> release_body.md
+          echo "For installation instructions, see the [README](https://github.com/${{ github.repository }})." >> release_body.md
+          
+          # Create release using GitHub CLI
+          gh release create "$TAG_NAME" \
+            --title "$TAG_NAME" \
+            --notes-file release_body.md \
+            --latest
+
+      - name: Summary
+        run: |
+          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag:** ${{ steps.version.outputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **GitHub Release:** Created" >> $GITHUB_STEP_SUMMARY
