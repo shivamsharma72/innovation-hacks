@@ -2,6 +2,7 @@
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { HitlBanner } from "@/components/chat/HitlBanner";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -16,10 +17,10 @@ interface Turn {
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const SILENCE_THRESHOLD  = 10;    // RMS below this = silence
-const SILENCE_DURATION   = 1000;  // ms of silence before we stop recognition
-const MIN_SPEECH_MS      = 500;   // ignore utterances shorter than this
-const BARGE_IN_THRESHOLD = 25;    // RMS to trigger barge-in while agent speaks
-const BARGE_IN_MS        = 220;   // ms of sustained speech to confirm barge-in
+const SILENCE_DURATION   = 2500;  // ms of silence before we stop recognition (increased to avoid cutting off mid-sentence)
+const MIN_SPEECH_MS      = 800;   // ignore utterances shorter than this
+const BARGE_IN_THRESHOLD = 28;    // mic RMS while agent speaks (ElevenLabs) — interrupt threshold
+const BARGE_IN_MS        = 350;   // ms of sustained voice before we cut TTS
 
 // ─── Ring ────────────────────────────────────────────────────────────────────
 
@@ -138,6 +139,23 @@ export function VoiceAgent() {
   const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
   const [error, setError]               = useState<string | null>(null);
   const [sessionId, setSessionId]       = useState<number | null>(null);
+  const [pendingActions, setPendingActions] = useState<any[]>([]);
+
+  const fetchPending = useCallback(async () => {
+    try {
+      const res = await fetch("/api/gateway/hitl");
+      if (res.ok) {
+        const data = await res.json();
+        setPendingActions(data.items ?? []);
+      }
+    } catch { /* silent */ }
+  }, []);
+
+  useEffect(() => {
+    fetchPending();
+    const id = setInterval(fetchPending, 10_000);
+    return () => clearInterval(id);
+  }, [fetchPending]);
 
   // Refs
   const recognitionRef  = useRef<any>(null);
@@ -153,6 +171,7 @@ export function VoiceAgent() {
   const sessionIdRef    = useRef<number | null>(null);
   // Playback control
   const audioElemRef      = useRef<HTMLAudioElement | null>(null);
+  const audioObjectUrlRef = useRef<string | null>(null);
   const ttsResolveRef     = useRef<(() => void) | null>(null);
   const bargeInStartRef   = useRef<number>(0);
   // Signals the sentence-loop in playElevenLabs to stop (set by stopPlayback / barge-in)
@@ -171,9 +190,13 @@ export function VoiceAgent() {
     playbackCancelRef.current = true;   // tell sentence loop to exit immediately
     if (audioElemRef.current) {
       audioElemRef.current.pause();
+      audioElemRef.current.src = "";
       audioElemRef.current = null;
     }
-    if (typeof window !== "undefined") window.speechSynthesis?.cancel();
+    if (audioObjectUrlRef.current) {
+      URL.revokeObjectURL(audioObjectUrlRef.current);
+      audioObjectUrlRef.current = null;
+    }
     const res = ttsResolveRef.current;
     ttsResolveRef.current = null;
     res?.();
@@ -227,6 +250,7 @@ export function VoiceAgent() {
             } else if (Date.now() - bargeInStartRef.current > BARGE_IN_MS) {
               bargeInStartRef.current = 0;
               stopPlayback();
+              setStatus("listening");  // immediate visual feedback
             }
           } else {
             bargeInStartRef.current = 0;
@@ -243,40 +267,66 @@ export function VoiceAgent() {
     }
   }, [stopPlayback]);
 
-  // ── Browser TTS fallback ──────────────────────────────────────────────────
+  // ── Play blob (ElevenLabs audio) — poll so barge-in / stop cuts audio mid-clip ──
 
-  const speakFallback = (text: string, onDone: () => void) => {
-    if (typeof window === "undefined" || !window.speechSynthesis) { onDone(); return; }
-    window.speechSynthesis.cancel();
-    const utt = new SpeechSynthesisUtterance(text);
-    utt.rate = 1.05;
-    ttsResolveRef.current = onDone;
-    utt.onend   = () => { ttsResolveRef.current = null; onDone(); };
-    utt.onerror = () => { ttsResolveRef.current = null; onDone(); };
-    window.speechSynthesis.speak(utt);
-  };
-
-  const speakFallbackAsync = (text: string) =>
-    new Promise<void>((res) => speakFallback(text, res));
-
-  // ── Play blob (ElevenLabs audio) ─────────────────────────────────────────
-
-  const playBlob = (blob: Blob, fallbackText: string) =>
+  const playBlob = (blob: Blob) =>
     new Promise<void>((resolve) => {
-      ttsResolveRef.current = resolve;
       const url = URL.createObjectURL(blob);
+      let pollHandle: number | null = null;
+      let settled = false;
+
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (pollHandle !== null) {
+          window.clearInterval(pollHandle);
+          pollHandle = null;
+        }
+        if (audioObjectUrlRef.current === url) {
+          URL.revokeObjectURL(url);
+          audioObjectUrlRef.current = null;
+        }
+        audioElemRef.current = null;
+        if (ttsResolveRef.current === resolve) ttsResolveRef.current = null;
+        resolve();
+      };
+
+      ttsResolveRef.current = resolve;
+      audioObjectUrlRef.current = url;
       const audio = new Audio(url);
       audioElemRef.current = audio;
-      const cleanup = () => { audioElemRef.current = null; ttsResolveRef.current = null; URL.revokeObjectURL(url); };
-      audio.onended = () => { cleanup(); resolve(); };
-      audio.onerror = () => { cleanup(); speakFallback(fallbackText, resolve); };
-      audio.play().catch(() => { cleanup(); speakFallback(fallbackText, resolve); });
+
+      pollHandle = window.setInterval(() => {
+        if (playbackCancelRef.current || !activeRef.current) {
+          audio.pause();
+          finish();
+        }
+      }, 64);
+
+      audio.onended = () => finish();
+      audio.onerror = () => finish();
+      audio.play().catch(() => finish());
     });
 
   // ── Sentence splitter (mirrors backend _split_sentences) ─────────────────
 
   const splitSentences = (text: string): string[] =>
     text.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
+
+  /** Strip common markdown so TTS does not say "hash hash" or "asterisk". */
+  const plainTextForSpeech = (raw: string): string => {
+    if (!raw) return raw;
+    let s = raw.replace(/\r\n/g, "\n");
+    s = s.replace(/```(?:\w+)?\n[\s\S]*?```/g, (m) => m.replace(/```[^\n]*\n?|```/g, "").trim());
+    s = s.replace(/^#{1,6}\s+/gm, "");
+    s = s.replace(/\*\*([^*]+)\*\*/g, "$1");
+    s = s.replace(/__([^_]+)__/g, "$1");
+    s = s.replace(/^\s*[-*+]\s+/gm, "");
+    s = s.replace(/^\s*\d+\.\s+/gm, "");
+    s = s.replace(/`+/g, "");
+    s = s.replace(/\n{3,}/g, "\n\n");
+    return s.trim();
+  };
 
   // ── Fetch a single sentence as an audio blob from ElevenLabs ─────────────
 
@@ -305,11 +355,14 @@ export function VoiceAgent() {
   //   previous one ends.
 
   const playElevenLabs = async (text: string): Promise<void> => {
-    if (!text.trim()) return;
-    const sentences = splitSentences(text);
+    const spoken = plainTextForSpeech(text);
+    if (!spoken.trim()) return;
+    const sentences = splitSentences(spoken);
     if (sentences.length === 0) return;
 
-    playbackCancelRef.current = false;  // reset for this TTS sequence
+    // NOTE: do NOT reset playbackCancelRef here — sendToAgent resets it once per
+    // turn before any audio plays. Resetting here causes barge-in to be ignored
+    // when the second playElevenLabs call (main reply) starts after preamble.
 
     // Kick off the first fetch immediately
     let currentFetch = fetchTTSBlob(sentences[0]);
@@ -324,10 +377,9 @@ export function VoiceAgent() {
       if (!activeRef.current || playbackCancelRef.current) break;
 
       if (blob) {
-        await playBlob(blob, sentences[i]);
-      } else {
-        await speakFallbackAsync(sentences[i]);
+        await playBlob(blob);
       }
+      // No browser SpeechSynthesis fallback — avoids Chrome speaking after End conversation
 
       if (nextFetch) currentFetch = nextFetch;
     }
@@ -382,6 +434,7 @@ export function VoiceAgent() {
 
   const sendToAgent = useCallback(async (text: string) => {
     if (!text.trim()) return;
+    playbackCancelRef.current = false;  // reset once per turn before any audio
     setStatus("processing");
     setTranscript("");
     setThinkingSteps([]);
@@ -389,13 +442,17 @@ export function VoiceAgent() {
     const newTurns: Turn[] = [...turnsRef.current, { role: "user", text }];
     setTurns(newTurns);
 
-    const history = newTurns.slice(-10).map((t) => ({
-      role:    t.role === "user" ? "user" : "assistant",
-      content: t.text,
-    }));
+    const historyForServer =
+      sessionIdRef.current != null
+        ? []
+        : newTurns.slice(-10).map((t) => ({
+            role: t.role === "user" ? "user" : "assistant",
+            content: t.text,
+          }));
 
     const collectedThoughts: string[] = [];
     let replyText = "";
+    let ttsText = "";
     // Preamble plays concurrently while agent fetches data
     let preambleAudioPromise: Promise<void> | null = null;
 
@@ -404,8 +461,11 @@ export function VoiceAgent() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          message:    text,
-          history:    history.slice(0, -1),
+          message: text,
+          history:
+            sessionIdRef.current != null
+              ? historyForServer
+              : historyForServer.slice(0, -1),
           session_id: sessionIdRef.current ?? undefined,
         }),
       });
@@ -432,7 +492,9 @@ export function VoiceAgent() {
           if (raw === "[DONE]") break outer;
           try {
             const evt = JSON.parse(raw);
-            if (evt.type === "preamble") {
+            if (evt.type === "meta" && typeof evt.session_id === "number") {
+              setSessionId(evt.session_id as number);
+            } else if (evt.type === "preamble") {
               // Speak preamble immediately via ElevenLabs — don't await, runs in parallel
               setStatus("speaking");
               preambleAudioPromise = playElevenLabs(evt.text as string).then(() => {
@@ -446,7 +508,9 @@ export function VoiceAgent() {
               collectedThoughts.push(evt.label as string);
               setThinkingSteps([...collectedThoughts]);
             } else if (evt.type === "reply") {
-              replyText = evt.text as string;
+              replyText = (evt.text as string) || "";
+              const alt = typeof evt.tts_text === "string" ? evt.tts_text.trim() : "";
+              ttsText = alt || replyText;
             } else if (evt.type === "error") {
               throw new Error(evt.message as string);
             }
@@ -473,13 +537,18 @@ export function VoiceAgent() {
       { role: "agent", text: replyText || "(no response)", thoughts: collectedThoughts },
     ]);
 
-    // Play full reply via ElevenLabs
-    if (replyText) {
+    // Spoken layer: human summary (tts_text) — on-screen already shows full replyText
+    if (ttsText && !playbackCancelRef.current) {
       setStatus("speaking");
-      await playElevenLabs(replyText);
+      await playElevenLabs(ttsText);
     }
 
-    if (activeRef.current) startListening();
+    // Always transition back to listening (covers barge-in path too)
+    stopPlayback();
+    if (activeRef.current) {
+      setStatus("listening");
+      startListening();
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [startListening, stopPlayback]);
 
@@ -495,6 +564,9 @@ export function VoiceAgent() {
   }, [startAnalyser, startListening]);
 
   const stop = useCallback(() => {
+    if (typeof window !== "undefined") {
+      window.speechSynthesis?.cancel();
+    }
     activeRef.current = false;
     cancelAnimationFrame(animFrameRef.current);
     if (silenceTimerRef.current) { clearTimeout(silenceTimerRef.current); silenceTimerRef.current = null; }
@@ -530,6 +602,9 @@ export function VoiceAgent() {
           Switch to text chat →
         </a>
       </div>
+
+      {/* HITL approval banner */}
+      <HitlBanner items={pendingActions} onResolved={fetchPending} />
 
       <div className="flex flex-1 overflow-hidden">
         {/* Left: ring + controls */}

@@ -16,7 +16,7 @@ from typing import Annotated, Optional, List, Dict, Literal, Any
 
 from email.message import EmailMessage
 from email.policy import SMTP
-from email.utils import formataddr
+from email.utils import formataddr, parseaddr
 
 from pydantic import Field
 from googleapiclient.errors import HttpError
@@ -698,6 +698,42 @@ async def _fetch_thread_reply_context(
         ],
         "target": target,
     }
+
+
+def _normalize_recipient_header(raw: str, field: str) -> str:
+    """
+    Gmail's send API rejects To/Cc/Bcc that are not RFC 5322 addresses (e.g. a bare name).
+    Accepts user@domain.com or Display Name <user@domain.com>; comma-separated OK.
+    """
+    cleaned = (raw or "").strip().replace("\r", "").replace("\n", " ")
+    if not cleaned:
+        raise UserInputError(
+            f"{field} is empty. Gmail needs a real email address. "
+            "Use search_contacts or list_contacts to resolve a name, "
+            "or ask the user for the exact address — never pass only a person's name."
+        )
+    out: list[str] = []
+    for part in cleaned.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        _name, addr = parseaddr(part)
+        addr = (addr or part).strip()
+        if "@" not in addr:
+            raise UserInputError(
+                f'Invalid {field} "{part}": not an email address. '
+                "Gmail returns Invalid To header when given a name or subject text instead of "
+                "user@domain. Call search_contacts first, then use the email from the results."
+            )
+        local, _, domain = addr.partition("@")
+        if not local or not domain:
+            raise UserInputError(
+                f'Invalid {field} "{part}": expected a complete address like name@school.edu.'
+            )
+        out.append(addr)
+    if not out:
+        raise UserInputError(f"{field} contained no valid email addresses.")
+    return ", ".join(out)
 
 
 async def _fetch_thread_message_ids(service, thread_id: str) -> List[str]:
@@ -1488,7 +1524,12 @@ async def get_gmail_attachment_content(
 async def send_gmail_message(
     service,
     user_google_email: str,
-    to: Annotated[str, Field(description="Recipient email address.")],
+    to: Annotated[
+        str,
+        Field(
+            description="Recipient email address(es), RFC 5322. Must be user@domain — not a person's name. Resolve names with search_contacts first."
+        ),
+    ],
     subject: Annotated[str, Field(description="Email subject.")],
     body: Annotated[str, Field(description="Email body content (plain text or HTML).")],
     body_format: Annotated[
@@ -1639,6 +1680,12 @@ async def send_gmail_message(
     logger.info(
         f"[send_gmail_message] Invoked. Email: '{user_google_email}', Subject: '{subject}', Attachments: {len(attachments) if attachments else 0}"
     )
+
+    to = _normalize_recipient_header(to, "To")
+    if cc:
+        cc = _normalize_recipient_header(cc, "Cc")
+    if bcc:
+        bcc = _normalize_recipient_header(bcc, "Bcc")
 
     # Prepare the email message
     # Use from_email (Send As alias) if provided, otherwise default to authenticated user
@@ -1899,6 +1946,13 @@ async def draft_gmail_message(
         )
     else:
         draft_body = _append_signature_to_body(draft_body, body_format, signature_html)
+
+    if to:
+        to = _normalize_recipient_header(to, "To")
+    if cc:
+        cc = _normalize_recipient_header(cc, "Cc")
+    if bcc:
+        bcc = _normalize_recipient_header(bcc, "Bcc")
 
     raw_message, thread_id_final, attached_count = _prepare_gmail_message(
         subject=subject,

@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.openai_tools import run_agent_conversation
 from app.config import get_settings
+from app.text_sanitize import strip_markdown_for_speech
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ class AgentState(TypedDict, total=False):
     user_email: str
     # Real-time tool-status callback (voice SSE stream)
     status_callback: Any  # Callable | None — not serialisable
-    # Skip intent_router for latency-sensitive paths (e.g. voice)
+    # Voice / SSE stream: tighter tool payloads and plain spoken replies
     voice_mode: bool
 
 
@@ -75,7 +76,7 @@ async def intent_router_node(state: AgentState) -> dict:
                         "needs_canvas (true if the query needs Canvas LMS data: courses, "
                         "assignments, grades, discussions, submissions), "
                         "needs_gws (true if it needs Google Workspace: Gmail, Calendar, "
-                        "Drive, Tasks, Docs, Sheets). "
+                        "Drive, Tasks, Docs, Sheets, Contacts). "
                         "Example: {\"needs_canvas\": true, \"needs_gws\": false}"
                     ),
                 },
@@ -107,12 +108,15 @@ async def agent_node(state: AgentState) -> dict:
         user_email=state.get("user_email"),
         db_session=state.get("db_session"),
         status_callback=state.get("status_callback"),
+        voice_mode=bool(state.get("voice_mode")),
     )
     return {"reply_text": reply, "sources": sources, "tool_trace": tool_trace}
 
 
 async def parallel_agent_node(state: AgentState) -> dict:
     """Fan-out: run canvas and gws tool loops concurrently, store raw results."""
+    vm = bool(state.get("voice_mode"))
+
     async def _canvas_loop() -> str:
         text, _, _ = await run_agent_conversation(
             state["message"],
@@ -122,6 +126,7 @@ async def parallel_agent_node(state: AgentState) -> dict:
             user_email=state.get("user_email"),
             db_session=state.get("db_session"),
             tool_prefix_filter="canvas__",
+            voice_mode=vm,
         )
         return text
 
@@ -134,6 +139,7 @@ async def parallel_agent_node(state: AgentState) -> dict:
             user_email=state.get("user_email"),
             db_session=state.get("db_session"),
             tool_prefix_filter="gws__",
+            voice_mode=vm,
         )
         return text
 
@@ -146,23 +152,31 @@ async def parallel_agent_node(state: AgentState) -> dict:
 async def synthesizer_node(state: AgentState) -> dict:
     """Merge canvas_result + gws_result into a single reply."""
     settings = get_settings()
+    vm = bool(state.get("voice_mode"))
     if not settings.openai_api_key:
         combined = f"Canvas: {state.get('canvas_result', '')}\n\nWorkspace: {state.get('gws_result', '')}"
-        return {"reply_text": combined}
+        reply0 = strip_markdown_for_speech(combined) if vm else combined
+        return {"reply_text": reply0}
 
     try:
         client = AsyncOpenAI(api_key=settings.openai_api_key)
+        sys_syn = (
+            "You are a concise academic assistant. "
+            "Synthesize the two data sources below into one clear, "
+            "helpful answer to the user's question. "
+            "Do not repeat raw data — summarise and connect insights."
+        )
+        if vm:
+            sys_syn += (
+                " The user may hear this via text-to-speech: use plain sentences only, "
+                "no markdown headings or bullet stars, and keep it brief."
+            )
         resp = await client.chat.completions.create(
             model=settings.openai_model,
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        "You are a concise academic assistant. "
-                        "Synthesize the two data sources below into one clear, "
-                        "helpful answer to the user's question. "
-                        "Do not repeat raw data — summarise and connect insights."
-                    ),
+                    "content": sys_syn,
                 },
                 {
                     "role": "user",
@@ -183,6 +197,8 @@ async def synthesizer_node(state: AgentState) -> dict:
             f"Workspace: {state.get('gws_result', '')}"
         )
 
+    if vm:
+        reply = strip_markdown_for_speech(reply)
     return {"reply_text": reply}
 
 
@@ -191,9 +207,7 @@ async def synthesizer_node(state: AgentState) -> dict:
 # ---------------------------------------------------------------------------
 
 def _route_entry(state: AgentState) -> str:
-    """Skip intent_router for voice — saves one full LLM round-trip."""
-    if state.get("voice_mode"):
-        return "agent"
+    """Always classify intent so Canvas+Workspace parallel routing stays correct."""
     return "intent_router"
 
 

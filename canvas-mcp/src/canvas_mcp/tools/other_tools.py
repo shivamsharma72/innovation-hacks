@@ -480,7 +480,14 @@ def register_other_tools(mcp: FastMCP):
             )
 
             if isinstance(members, dict) and "error" in members:
-                output += f"Error fetching members: {members['error']}\n"
+                err = str(members["error"])
+                if "403" in err or "unauthorized" in err.lower():
+                    output += (
+                        "Members: not listed — Canvas returned permission denied for this group "
+                        "(common for student tokens; group metadata above is still valid).\n"
+                    )
+                else:
+                    output += f"Error fetching members: {members['error']}\n"
             elif not members:
                 output += "No members in this group.\n"
             else:

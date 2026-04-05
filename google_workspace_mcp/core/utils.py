@@ -495,8 +495,8 @@ def handle_http_errors(
                                 f"The required API is not enabled for your project. "
                                 f"Please check the Google Cloud Console to enable it."
                             )
-                    elif error.resp.status in [401, 403]:
-                        # Authentication/authorization errors
+                    elif error.resp.status == 401:
+                        # Missing or invalid credentials
                         if is_oauth21_enabled():
                             if is_external_oauth21_provider():
                                 auth_hint = (
@@ -518,6 +518,31 @@ def handle_http_errors(
                             f"You might need to re-authenticate for user '{user_google_email}'. "
                             f"{auth_hint}"
                         )
+                    elif error.resp.status == 403:
+                        # 403 is often missing API enablement, OAuth scope, or org policy — not a dead session.
+                        el = error_details.lower()
+                        if "insufficient authentication scopes" in el:
+                            message = (
+                                f"API error in {tool_name}: {error}. "
+                                f"The OAuth token is valid but does not include a scope needed for this action. "
+                                f"Sign in again via Workspace MCP and accept all requested Google permissions. "
+                                f"User: {user_google_email}"
+                            )
+                        elif "caller does not have permission" in el:
+                            message = (
+                                f"API error in {tool_name}: {error}. "
+                                f"Google rejected this operation (permission). Typical causes: "
+                                f"Google Docs/Drive API not enabled for your Cloud project, OAuth client missing "
+                                f"required scopes, or your school/org policy blocks creating this resource. "
+                                f"This is not the same as 'not logged in'. User: {user_google_email}"
+                            )
+                        else:
+                            message = (
+                                f"API error in {tool_name}: {error}. "
+                                f"If your session works for other Google tools, this is likely a scope, API "
+                                f"enablement, or permissions issue—not a generic auth failure. "
+                                f"User: {user_google_email}"
+                            )
                     else:
                         # Other HTTP errors (400 Bad Request, etc.) - don't suggest re-auth
                         message = f"API error in {tool_name}: {error}"

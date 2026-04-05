@@ -258,7 +258,17 @@ async def make_canvas_request(
                         error_details = e.response.text
                         error_message += f", Text: {error_details}"
 
-                    log_error(f"API error on {sanitize_url(endpoint)}", status_code=e.response.status_code)
+                    # Students often cannot list group rosters; 403 is expected, not a broken token.
+                    if e.response.status_code == 403 and "/groups/" in endpoint and "/users" in endpoint:
+                        log_warning(
+                            "Canvas returned 403 for group members (role may not allow roster access)",
+                            endpoint=sanitize_url(endpoint),
+                        )
+                    else:
+                        log_error(
+                            f"API error on {sanitize_url(endpoint)}",
+                            status_code=e.response.status_code,
+                        )
 
                     # Audit: log HTTP error (status code only — response body may contain PII)
                     log_data_access(method, endpoint, "error", f"HTTP {e.response.status_code}")
@@ -416,7 +426,11 @@ async def fetch_all_paginated_results(endpoint: str, params: dict[str, Any] | No
         response = await make_canvas_request("get", endpoint, params=current_params, skip_anonymization=True)
 
         if isinstance(response, dict) and "error" in response:
-            log_error(f"Error fetching page {page}", error=response['error'])
+            err = str(response.get("error", ""))
+            if "403" in err and "/groups/" in endpoint and "/users" in endpoint:
+                log_warning(f"Stopped pagination for page {page}", error=err[:200])
+            else:
+                log_error(f"Error fetching page {page}", error=response["error"])
             return response
 
         if not response or not isinstance(response, list) or len(response) == 0:

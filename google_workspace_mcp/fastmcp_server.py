@@ -143,10 +143,6 @@ import gmail.gmail_tools
 import gdrive.drive_tools
 import gcalendar.calendar_tools
 import gdocs.docs_tools
-import gsheets.sheets_tools
-import gchat.chat_tools
-import gforms.forms_tools
-import gslides.slides_tools
 import gtasks.tasks_tools
 import gsearch.search_tools
 
@@ -159,10 +155,6 @@ all_services = [
     "drive",
     "calendar",
     "docs",
-    "sheets",
-    "chat",
-    "forms",
-    "slides",
     "tasks",
     "search",
 ]

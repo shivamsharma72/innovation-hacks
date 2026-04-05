@@ -1,10 +1,11 @@
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", populate_by_name=True)
 
     auth0_domain: str = ""
     auth0_audience: str = ""
@@ -23,6 +24,10 @@ class Settings(BaseSettings):
     google_client_id: str = ""
     google_client_secret: str = ""
 
+    # When Auth0 JWT has no email (or wrong claim), still force Workspace MCP identity:
+    # must match the Google account that completed OAuth at Workspace MCP.
+    user_google_email_fallback: str = Field(default="", validation_alias="USER_GOOGLE_EMAIL")
+
     cors_origins: str = "http://localhost:3000"
 
     # Dev bypass: set SKIP_AUTH=true only on local machine
@@ -38,7 +43,7 @@ class Settings(BaseSettings):
     canvas_api_token: str = ""
     canvas_domain: str = ""
     canvas_api_url: str = ""
-    mcp_max_tools: int = 120
+    mcp_max_tools: int = 128
     mcp_tool_description_max_chars: int = 400
 
     # Shown when Workspace MCP returns auth errors (browser URL, e.g. http://localhost:8002).

@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { auth0 } from "@/lib/auth0";
 import AppLayout from "@/components/layout/AppLayout";
+import { PageHeader } from "@/components/layout/InternalChrome";
 import { OnboardingForm } from "./ui";
 
 export default async function OnboardingPage() {
@@ -30,10 +31,13 @@ export default async function OnboardingPage() {
 
   return (
     <AppLayout>
-      <div className="mx-auto max-w-lg px-6 py-10">
-        <h1 className="text-xl font-semibold text-white mb-2">Setup</h1>
+      <div className="mx-auto max-w-lg px-4 py-6 sm:px-6 sm:py-8">
+        <PageHeader
+          title="Setup"
+          description="Connect Canvas here; complete Google OAuth on your Workspace MCP server when you use Gmail, Calendar, or Tasks."
+        />
 
-        <section className="mt-6">
+        <section className="mt-8">
           <h2 className="text-base font-medium text-zinc-200">Google Workspace</h2>
           <p className="mt-1.5 text-sm text-zinc-400">
             Open your Workspace MCP URL (e.g. <code className="text-zinc-300">http://localhost:8002</code>) and

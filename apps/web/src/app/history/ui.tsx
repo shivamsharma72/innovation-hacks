@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { PageHeader } from "@/components/layout/InternalChrome";
 
 interface Session {
   id: number;
@@ -59,11 +60,17 @@ export function HistoryClient() {
   };
 
   return (
-    <div className="flex flex-1 overflow-hidden">
-      {/* Session list */}
-      <div className="w-64 flex-shrink-0 border-r border-zinc-800 overflow-auto flex flex-col">
-        <div className="px-4 py-4 border-b border-zinc-800">
-          <h1 className="text-sm font-semibold text-white">Conversation History</h1>
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <PageHeader
+        title="History"
+        description="Browse past chat sessions. Resume continues in Chat with the same thread context when supported."
+      />
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+      <div className="flex w-64 shrink-0 flex-col overflow-auto border-r border-zinc-800/90">
+        <div className="border-b border-zinc-800/90 px-4 py-3">
+          <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
+            Sessions
+          </h2>
         </div>
         {loading && <p className="p-4 text-xs text-zinc-500">Loading…</p>}
         {!loading && sessions.length === 0 && (
@@ -72,8 +79,10 @@ export function HistoryClient() {
         {sessions.map((s) => (
           <button
             key={s.id}
+            type="button"
             onClick={() => openSession(s)}
-            className={`w-full text-left px-4 py-3 border-b border-zinc-800/60 transition-colors group ${
+            aria-current={selected?.id === s.id ? "true" : undefined}
+            className={`group w-full border-b border-zinc-800/60 px-4 py-3 text-left transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-500 ${
               selected?.id === s.id ? "bg-indigo-600/10" : "hover:bg-zinc-800/50"
             }`}
           >
@@ -86,25 +95,29 @@ export function HistoryClient() {
       </div>
 
       {/* Message viewer */}
-      <div className="flex flex-1 flex-col overflow-hidden">
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {!selected ? (
-          <div className="flex flex-1 items-center justify-center text-sm text-zinc-600">
-            Select a conversation to view
+          <div className="flex flex-1 items-center justify-center px-4 text-center text-sm text-zinc-500">
+            Select a conversation to view messages.
           </div>
         ) : (
           <>
-            <div className="flex items-center justify-between border-b border-zinc-800 px-6 py-4">
-              <h2 className="text-sm font-medium text-zinc-200 truncate">{selected.title}</h2>
-              <div className="flex gap-2">
+            <div className="flex items-center justify-between gap-2 border-b border-zinc-800/90 px-4 py-3 sm:px-6">
+              <h2 className="min-w-0 truncate text-sm font-medium text-zinc-200">
+                {selected.title}
+              </h2>
+              <div className="flex shrink-0 gap-2">
                 <button
+                  type="button"
                   onClick={() => resume(selected)}
-                  className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500 transition-colors"
+                  className="rounded-lg bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-indigo-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400"
                 >
                   Resume
                 </button>
                 <button
-                  onClick={() => deleteSession(selected)}
-                  className="rounded-lg border border-zinc-700 px-3 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800 transition-colors"
+                  type="button"
+                  onClick={() => void deleteSession(selected)}
+                  className="rounded-lg border border-zinc-700 px-3 py-1.5 text-xs text-zinc-400 transition-colors hover:bg-zinc-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-zinc-500"
                 >
                   Delete
                 </button>
@@ -128,6 +141,7 @@ export function HistoryClient() {
             </div>
           </>
         )}
+      </div>
       </div>
     </div>
   );

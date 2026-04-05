@@ -13,6 +13,12 @@ type PendingAction = {
   created_at: string;
 };
 
+const QUICK_PROMPTS = [
+  "What are my upcoming Canvas assignments?",
+  "Summarize unread emails from this week.",
+  "What's on my calendar tomorrow?",
+];
+
 interface Props {
   initialSessionId?: number | null;
   initialQuery?: string | null;
@@ -106,16 +112,43 @@ export function ChatClient({ initialSessionId, initialQuery }: Props) {
   };
 
   return (
-    <div className="flex flex-col flex-1 overflow-hidden">
-      {/* HITL banner */}
+    <div className="flex flex-1 flex-col overflow-hidden">
+      <header className="shrink-0 border-b border-zinc-800/90 bg-zinc-950/40 px-4 py-3 sm:px-5">
+        <h1 className="text-base font-semibold tracking-tight text-white">
+          Chat
+        </h1>
+        <p className="mt-0.5 text-xs text-zinc-500">
+          Grounded in your Canvas and Google Workspace tools when connected.
+        </p>
+      </header>
+
       <HitlBanner items={pendingActions} onResolved={refreshHitl} />
 
-      {/* Messages */}
-      <div className="flex-1 overflow-auto px-4 py-4 space-y-4">
+      <div className="flex-1 space-y-4 overflow-auto px-4 py-4">
         {messages.length === 0 && (
-          <p className="text-sm text-zinc-600 text-center mt-8">
-            Ask me anything about your courses, assignments, calendar, or tasks.
-          </p>
+          <div className="mx-auto mt-4 max-w-lg space-y-4 text-center">
+            <p className="text-sm text-zinc-500">
+              Ask anything about courses, assignments, calendar, Gmail, or
+              tasks—or try a starter below.
+            </p>
+            <div
+              className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:justify-center"
+              role="group"
+              aria-label="Suggested prompts"
+            >
+              {QUICK_PROMPTS.map((q) => (
+                <button
+                  key={q}
+                  type="button"
+                  onClick={() => void send(q)}
+                  disabled={loading}
+                  className="rounded-full border border-zinc-700/90 bg-zinc-900/50 px-3 py-1.5 text-left text-xs text-zinc-300 transition hover:border-indigo-500/50 hover:bg-zinc-800/80 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 disabled:opacity-40 sm:text-center"
+                >
+                  {q}
+                </button>
+              ))}
+            </div>
+          </div>
         )}
         {messages.map((msg, i) => (
           <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
@@ -152,8 +185,18 @@ export function ChatClient({ initialSessionId, initialQuery }: Props) {
           <button
             type="button"
             onClick={() => setVoiceMode((v) => !v)}
-            title={voiceMode ? "Voice mode on — responses will play as audio" : "Enable voice response mode"}
-            className={`flex h-9 w-9 items-center justify-center rounded-lg border text-sm transition-colors ${
+            title={
+              voiceMode
+                ? "Voice mode on — responses will play as audio"
+                : "Enable voice response mode"
+            }
+            aria-pressed={voiceMode}
+            aria-label={
+              voiceMode
+                ? "Disable spoken responses"
+                : "Enable spoken responses with ElevenLabs"
+            }
+            className={`flex h-9 w-9 items-center justify-center rounded-lg border text-sm transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 ${
               voiceMode
                 ? "border-indigo-500 bg-indigo-600/20 text-indigo-300"
                 : "border-zinc-700 text-zinc-500 hover:border-zinc-500"
@@ -163,19 +206,24 @@ export function ChatClient({ initialSessionId, initialQuery }: Props) {
           </button>
 
           <input
-            className="flex-1 rounded-xl border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm text-zinc-200 placeholder-zinc-600 outline-none focus:border-indigo-500 transition-colors"
+            className="flex-1 rounded-xl border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm text-zinc-200 placeholder-zinc-600 outline-none transition-colors focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/40"
             placeholder="Message…"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && (e.preventDefault(), void send())}
+            onKeyDown={(e) =>
+              e.key === "Enter" &&
+              !e.shiftKey &&
+              (e.preventDefault(), void send())
+            }
             disabled={loading}
+            aria-label="Message to assistant"
           />
 
           <button
             type="button"
             onClick={() => void send()}
             disabled={loading || !input.trim()}
-            className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-40 transition-colors"
+            className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-500 disabled:opacity-40 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
           >
             Send
           </button>

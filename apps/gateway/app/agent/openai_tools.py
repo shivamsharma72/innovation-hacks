@@ -9,6 +9,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.canvas_mcp_util import mcp_canvas_request_headers
 from app.config import Settings, get_settings
 from app.mcp_runtime import build_mcp_runtime
+from app.text_sanitize import (
+    condense_tool_text,
+    strip_markdown_for_speech,
+    tool_result_char_budget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +45,8 @@ TOOL_DISPLAY_LABELS: dict[str, str] = {
     # GWS — Gmail
     "gws__list_messages":           "Reading your emails",
     "gws__get_message":             "Opening an email",
+    "gws__search_gmail_messages":   "Searching your inbox",
+    "gws__get_gmail_message_content": "Opening an email",
     "gws__send_gmail_message":      "Preparing to send email",
     "gws__search_messages":         "Searching your inbox",
     "gws__create_draft":            "Drafting an email",
@@ -72,27 +79,64 @@ _AUTH_FAILURE_MARKERS = (
     "authentication failed",
     "no authorization code",
     "not authenticated",
-    "unauthorized",
     "invalid_grant",
     "invalid_client",
-    "oauth",
+    # Do not use bare "oauth" — Google consent URLs contain "/oauth2/" and would false-positive.
+    "oauth error",
+    "oauth failed",
     "access denied",
-    "re-authenticat",
     "login required",
     "token has been expired",
     "token expired",
     "refresh token",
     "revoked",
-    "403 forbidden",
     "invalid access token",
+    # Narrow HTTP hints (avoid bare "unauthorized" / "re-authenticat" — Workspace MCP appends those on many 403s)
+    "http error: 401",
+    "http 401",
+    "status': 401",
+    "status\": 401",
 )
 
 
 def _looks_like_auth_failure(text: str) -> bool:
     if not text:
         return False
-    sample = text[:12_000].lower()
-    return any(m in sample for m in _AUTH_FAILURE_MARKERS)
+    sample = text[:12_000]
+    low = sample.lower()
+    compact = low.replace(" ", "").replace("\n", "")
+
+    # Workspace MCP returned an explicit consent flow with a real link — let the full tool text
+    # reach the model so the user sees the authorization URL (gateway abort used only first line).
+    if "action required: google authentication needed" in low:
+        return False
+    if "authorization url:" in low and "accounts.google.com" in low:
+        return False
+
+    # Valid OAuth session but Google refused this API call (scopes, API disabled, admin policy).
+    if "caller does not have permission" in low:
+        return False
+    if "does not have permission" in low and "httperror403" in compact:
+        return False
+    if "accessnotconfigured" in compact:
+        return False
+    if "insufficient authentication scopes" in low:
+        return True
+
+    if any(m in low for m in _AUTH_FAILURE_MARKERS):
+        return True
+    # Legacy / broad phrases only when clearly token/session (not Google Docs 403, etc.)
+    if "re-authenticat" in low and (
+        "invalid_grant" in low
+        or "invalid_client" in low
+        or "http error: 401" in compact
+        or "token expired" in low
+        or "login required" in low
+    ):
+        return True
+    if low.startswith("http error: 401") or " http error: 401" in low:
+        return True
+    return False
 
 
 def _auth_abort_message(
@@ -110,11 +154,13 @@ def _auth_abort_message(
         return (
             "**Google Workspace MCP is not authenticated** (or the session expired). "
             "Stop here—no need to retry the same tools until sign-in works.\n\n"
-            f"1. Open **`{browser}/oauth/google/authorize`** (or `{browser}` and click "
-            "**Sign in with Google**) so the browser gets a full OAuth URL — long links "
-            "copied from chat are often truncated and cause Google error `missing response_type`.\n"
+            f"1. Open [{browser}/oauth/google/authorize]({browser}/oauth/google/authorize) "
+            f"(or {browser} and click **Sign in with Google**) so the browser gets a full OAuth URL — "
+            "long links copied from chat are often truncated and cause Google error `missing response_type`.\n"
             "2. Ensure `http://localhost:8002/oauth2callback` is allowed in Google Cloud "
-            "for your OAuth client.\n\n"
+            "for your OAuth client.\n"
+            "3. If you use Calendar/Drive/Gmail after only signing in to some scopes, "
+            "complete consent again and accept **all** permissions Google shows.\n\n"
             f"Server detail: {snippet}"
         )
     if tool_name.startswith("canvas__") or source == "mcp_canvas":
@@ -166,6 +212,7 @@ async def run_agent_conversation(
     db_session: AsyncSession | None = None,
     tool_prefix_filter: str | None = None,
     status_callback: Any | None = None,  # called with {type, tool, label} on each tool call
+    voice_mode: bool = False,  # voice UI: shorter tool payloads, plain-text replies, spoken brevity
 ) -> tuple[str, list[str], list[dict[str, Any]]]:
     settings = get_settings()
     if not settings.openai_api_key:
@@ -177,6 +224,16 @@ async def run_agent_conversation(
 
     canvas_mcp = bool(settings.mcp_canvas_url.strip())
     gws_mcp = bool(settings.mcp_google_workspace_url.strip())
+
+    # Bind Workspace MCP to one Google identity (JWT email, else USER_GOOGLE_EMAIL in .env).
+    effective_user_google = (user_email or "").strip() or (
+        settings.user_google_email_fallback or ""
+    ).strip() or None
+    if gws_mcp and not effective_user_google:
+        logger.warning(
+            "Google Workspace MCP is enabled but neither Auth0 email nor USER_GOOGLE_EMAIL is set; "
+            "the model may pass the wrong user_google_email (e.g. a contact's address)."
+        )
 
     canvas_headers = canvas_mcp_headers
     if canvas_mcp and canvas_headers is None:
@@ -196,6 +253,7 @@ async def run_agent_conversation(
                 canvas_http_headers=canvas_headers if canvas_mcp else None,
                 max_tools=settings.mcp_max_tools,
                 desc_max_chars=settings.mcp_tool_description_max_chars,
+                gws_user_email=effective_user_google,
             )
         except Exception:
             logger.exception(
@@ -240,12 +298,20 @@ async def run_agent_conversation(
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
     model = settings.openai_model
+    from datetime import date as _date
+    today_str = _date.today().isoformat()   # e.g. "2026-04-05"
     system = (
+        f"Today's date is {today_str}. "
+        "Always use the current date when constructing time ranges for calendar, "
+        "email, or task queries unless the user specifies otherwise. "
         "You are a concise academic assistant. "
         "Use the tools to fetch real data; never invent due dates or grades. "
         "If a source is missing, say so briefly. "
         "All Canvas data must come from canvas__* tools (Canvas MCP). "
         "Do not claim you cannot access Canvas if canvas__ tools are listed—call them. "
+        "For tools with course_identifier, prefer the numeric course id from canvas__list_courses "
+        "or the course_id printed by canvas__get_my_upcoming_assignments; short labels (e.g. SER594) "
+        "can 404 if they are not the real Canvas course id. "
         "Match the user's question to the tool names and descriptions you were given "
         "(e.g. courses vs assignments vs discussions). "
         "Google (Gmail, Calendar, Drive, …) uses gws__* tools (Workspace MCP). "
@@ -272,8 +338,41 @@ async def run_agent_conversation(
         "Do NOT loop — if gws__manage_task with action=create succeeds or returns [HITL_PENDING], stop immediately. "
         "If a tool result contains [HITL_PENDING:...], tell the user: "
         "'I've queued this action — click the amber notification in the sidebar to approve it.' "
-        "Do NOT say you are unable to perform the action."
+        "Do NOT say you are unable to perform the action. "
+        "If multiple tools ran in the same turn and one result is [HITL_PENDING] while another asks for "
+        "Google OAuth / People authorization: lead with the queued approval (the send or write is waiting "
+        "for them in the UI). Only mention signing in to Google if a separate step truly failed for "
+        "missing Workspace access—do not suggest OAuth blocks approving an email that is already queued."
     )
+    if gws_mcp:
+        system += (
+            " Google Workspace tool quirks: "
+            "Gmail: call gws__search_gmail_messages first, then gws__get_gmail_message_content "
+            "using the full Message ID string from the search output (long alphanumeric id). "
+            "Never use the list index (1, 2, …) as message_id; never call get_gmail_message_content "
+            "in parallel with search before you have that id. "
+            "For gws__get_gmail_message_content, body_format must be one of "
+            "`text`, `html`, or `raw` (never `plain`). "
+            "For gws__manage_drive_access, `action` must be one of: "
+            "`grant`, `grant_batch`, `update`, `revoke`, `transfer_owner` (there is no `set`). "
+            "If a tool result says the MCP server could not be reached, tell the user to start "
+            "Workspace MCP (`./scripts/run-workspace-mcp-local.sh`, port 8002) and retry — do not "
+            "retry the same tool until it is running. "
+            "Gmail READ-ONLY (latest email, unread, search inbox, open a message): use ONLY "
+            "gws__search_gmail_messages and gws__get_gmail_message_content (and related Gmail read tools). "
+            "Do NOT call gws__search_contacts or gws__list_contacts for these requests. "
+            "EMAIL RECIPIENTS (send or draft only): When the user wants to send or draft mail and the "
+            "recipient address is missing or ambiguous—not when merely reading mail—resolve it before "
+            "send/draft tools: gws__search_contacts or gws__list_contacts, then if needed "
+            "gws__search_gmail_messages for past threads with that person; if still unclear, ask the user "
+            "for the exact address. Never invent or guess email addresses. "
+            "CONTACT LOOKUP BY NAME: If the user wants to find someone in their Google contacts or "
+            "address book, use gws__search_contacts (preferred, pass the name as query) or gws__list_contacts. "
+            "Do NOT use gws__search_gmail_messages for contact-only lookup. "
+            "VOICE / SPEECH: The user message may be speech-to-text—names may appear with spurious spaces "
+            "between letters or sound-alike words (e.g. 'survey' vs a person's name). Infer the intended "
+            "person name and search contacts with that name, not a nonsense Gmail query."
+        )
     if canvas_mcp and not mcp_has_canvas:
         system += (
             " Note: MCP_CANVAS_URL is configured but no canvas__ tools were registered—"
@@ -282,13 +381,14 @@ async def run_agent_conversation(
 
     # Inject the authenticated user's Google email so gws__ tools receive user_google_email.
     # This is REQUIRED in OAuth 2.0 mode — every gws__ tool call must include it.
-    if user_email:
+    if effective_user_google:
         system += (
-            f"\n\nAUTHENTICATED USER EMAIL: {user_email}\n"
-            f"CRITICAL: Every gws__* tool call MUST include user_google_email=\"{user_email}\" "
-            "as a parameter. Never omit it or use a placeholder.\n"
+            f"\n\nAUTHENTICATED USER EMAIL (Google Workspace identity): {effective_user_google}\n"
+            f"CRITICAL: Every gws__* tool call MUST use user_google_email=\"{effective_user_google}\" "
+            "only—the logged-in user's Google account. Never use the email of a recipient, contact, or "
+            "other person as user_google_email.\n"
             f"GOOGLE TASKS: To create a task use ONLY gws__manage_task with EXACTLY these params: "
-            f'action="create", task_list_id="@default", title="<task title>", user_google_email="{user_email}". '
+            f'action="create", task_list_id="@default", title="<task title>", user_google_email="{effective_user_google}". '
             "Do NOT call list_task_lists first. Do NOT call manage_drive_access or any other tool. "
             "task_list_id='@default' is always valid — never change it."
         )
@@ -302,6 +402,19 @@ async def run_agent_conversation(
                 system += f"\n\n{memory_str}"
         except Exception:
             logger.debug("Failed to read user memory", exc_info=True)
+
+    if voice_mode:
+        system += (
+            "\n\nVOICE SESSION: The user sees this reply as on-screen text in the voice UI. "
+            "Give a complete, useful answer (assignments with names and due dates, etc.)—do not "
+            "short-change detail they need to read. "
+            "Prefer plain sentences; avoid markdown headings and asterisk bullets so the transcript stays readable. "
+            "A separate short line will be used for spoken audio; you do not need to optimize for brevity. "
+            "The latest user message is from speech recognition—it may be imperfect; reason about likely names "
+            "and intents before choosing tools."
+        )
+
+    _tool_cap = tool_result_char_budget(voice_mode=voice_mode)
 
     # HITL write-tool list
     hitl_tools: set[str] = set()
@@ -330,6 +443,15 @@ async def run_agent_conversation(
             choice = resp.choices[0]
             msg = choice.message
             if msg.tool_calls:
+                names_in_turn = {tc.function.name for tc in msg.tool_calls}
+                # Gmail list + fetch in one model turn always race (gather runs both before the
+                # model sees search output), which yields bogus message_id values and 404s—more
+                # common under voice latency pressure. Force a second turn after search results.
+                block_gmail_get_after_search = (
+                    "gws__search_gmail_messages" in names_in_turn
+                    and "gws__get_gmail_message_content" in names_in_turn
+                )
+
                 messages.append(
                     {
                         "role": "assistant",
@@ -351,6 +473,15 @@ async def run_agent_conversation(
                 async def _run_tool_call(
                     tool_name: str, args_obj: dict[str, Any]
                 ) -> tuple[str, str]:
+                    if block_gmail_get_after_search and tool_name == "gws__get_gmail_message_content":
+                        return (
+                            "Skipped: get_gmail_message_content was bundled with search_gmail_messages "
+                            "in the same assistant turn, so the real message_id was not available yet. "
+                            "Read the search_gmail_messages result above, copy the full Message ID "
+                            "(long alphanumeric string, not the list number 1/2/…), then call "
+                            "get_gmail_message_content alone in your next turn with that message_id.",
+                            "gmail_sequence",
+                        )
                     # Notify caller (e.g. voice SSE stream) of in-progress tool call
                     if status_callback:
                         label = TOOL_DISPLAY_LABELS.get(
@@ -416,6 +547,7 @@ async def run_agent_conversation(
                     zip(msg.tool_calls, parsed_args, results, strict=True)
                 )
                 auth_abort: str | None = None
+                mcp_unreachable_abort: str | None = None
                 for tc, args_obj, (text, src) in zipped:
                     if src not in sources:
                         sources.append(src)
@@ -453,26 +585,60 @@ async def run_agent_conversation(
                                 round_idx,
                                 tc.function.name,
                             )
+                    low = text.lower()
+                    if (
+                        src == "mcp_error"
+                        and mcp_unreachable_abort is None
+                        and (
+                            "could not reach" in low
+                            or "connection failed" in low
+                            or "server unreachable" in low
+                        )
+                    ):
+                        mcp_unreachable_abort = text.strip()
 
                 for tc, _args, (text, _src) in zipped:
+                    # Voice uses a smaller default tool cap; contact lists are often huge—do not truncate
+                    # so badly that names in the roster never reach the model (causes chat vs voice mismatch).
+                    _cap = _tool_cap
+                    if tc.function.name in (
+                        "gws__list_contacts",
+                        "gws__search_contacts",
+                    ):
+                        _cap = max(_tool_cap, 14_000)
+                    model_tool_text = condense_tool_text(
+                        text, tc.function.name, max_chars=_cap
+                    )
                     messages.append(
                         {
                             "role": "tool",
                             "tool_call_id": tc.id,
-                            "content": text,
+                            "content": model_tool_text,
                         }
                     )
 
+                if mcp_unreachable_abort is not None:
+                    r = (
+                        strip_markdown_for_speech(mcp_unreachable_abort)
+                        if voice_mode
+                        else mcp_unreachable_abort
+                    )
+                    return r, sources, tool_trace
                 if auth_abort is not None:
-                    return auth_abort, sources, tool_trace
+                    r = strip_markdown_for_speech(auth_abort) if voice_mode else auth_abort
+                    return r, sources, tool_trace
 
                 continue
 
             text = (msg.content or "").strip()
             _final_reply = text or "(empty model response)"
+            if voice_mode:
+                _final_reply = strip_markdown_for_speech(_final_reply)
             return (_final_reply, sources, tool_trace)
 
         _final_reply = "Too many tool rounds — try a shorter request or fewer actions at once."
+        if voice_mode:
+            _final_reply = strip_markdown_for_speech(_final_reply)
         return (_final_reply, sources, tool_trace)
     finally:
         # Cancel keepalive before closing sessions

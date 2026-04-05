@@ -15,3 +15,13 @@ body {
   color: var(--foreground);
   background: var(--background);
 }
+
+/* Landing: respect reduced motion (HCI); hide heavy WebGL scene */
+@media (prefers-reduced-motion: reduce) {
+  .landing-spline-host {
+    display: none !important;
+  }
+  .landing-spline-fallback {
+    display: flex !important;
+  }
+}

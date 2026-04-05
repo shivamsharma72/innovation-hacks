@@ -22,6 +22,10 @@ def register_student_tools(mcp: FastMCP):
     async def get_my_upcoming_assignments(days: int = 7) -> str:
         """Get your upcoming assignments across all courses.
 
+        Each item includes numeric ``course_id`` and ``assignment_id`` so follow-up tools
+        (e.g. assignment details) can use those values directly—short course labels alone
+        are not always valid Canvas API identifiers.
+
         Args:
             days: Number of days to look ahead (default: 7)
         """
@@ -84,9 +88,16 @@ def register_student_tools(mcp: FastMCP):
             else:
                 status = "❌ Not Submitted"
 
+            ids_line = ""
+            if course_id is not None and assignment_id is not None:
+                ids_line = (
+                    f"  course_id={course_id}  assignment_id={assignment_id}\n"
+                )
+
             output_lines.append(
                 f"• {name}\n"
                 f"  Course: {course_display}\n"
+                f"{ids_line}"
                 f"  Due: {due_at}\n"
                 f"  Status: {status}\n"
             )

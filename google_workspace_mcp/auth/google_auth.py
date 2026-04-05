@@ -410,7 +410,9 @@ def _determine_oauth_prompt(
         # Verify the credentials can still be refreshed before using select_account.
         # When credentials are revoked, Google's select_account prompt may produce
         # incomplete callbacks (missing state parameter, partial scopes).
-        if existing_credentials.valid:
+        # Also require a refresh_token — without one, select_account won't get a new
+        # refresh token from Google; only prompt=consent forces Google to issue one.
+        if existing_credentials.valid and existing_credentials.refresh_token:
             logger.info(
                 f"[start_auth_flow] Using prompt='select_account' for re-auth of {normalized_email}."
             )

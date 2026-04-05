@@ -15,6 +15,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
+import httpx
 import mcp.types as mcp_types
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
@@ -23,6 +24,30 @@ from mcp.shared._httpx_utils import create_mcp_http_client
 logger = logging.getLogger(__name__)
 
 _OPENAI_NAME_MAX = 64
+
+_GOOGLE_MCP_HINT = (
+    "Start it from the repo root: `./scripts/run-workspace-mcp-local.sh` "
+    "(listens on http://127.0.0.1:8002/mcp). Docker: `docker compose up workspace-mcp`."
+)
+
+
+def _is_unreachable_mcp_error(exc: BaseException) -> bool:
+    """True if *exc* or nested ExceptionGroup is a transport-level failure to the MCP server."""
+    if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException)):
+        return True
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_is_unreachable_mcp_error(e) for e in exc.exceptions)
+    return False
+
+
+def _mcp_unreachable_message(url: str, mcp_name: str) -> str:
+    return (
+        f"MCP connection failed for `{mcp_name}` — could not reach {url}. "
+        f"The MCP server is not accepting connections (connection refused or timeout). "
+        f"{_GOOGLE_MCP_HINT}"
+    )
+
+
 _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 
 
@@ -140,6 +165,9 @@ class McpToolRuntime:
     _live_sessions: dict[str, ClientSession] = field(default_factory=dict)
     _stack: AsyncExitStack | None = None
     _close: Callable[[], Awaitable[None]] | None = None
+    # Authenticated user email — force-injected into every gws__ tool call so the
+    # LLM cannot accidentally use a contact's or recipient's email as user_google_email.
+    _gws_user_email: str | None = None
 
     async def _get_or_reconnect(self, url: str, extra_headers: dict[str, str] | None) -> ClientSession | None:
         """Return the live session for *url*, creating a new one if needed."""
@@ -152,8 +180,14 @@ class McpToolRuntime:
                 )
                 self._live_sessions[url] = session
                 logger.info("MCP reconnected url=%s", url)
-            except Exception:
-                logger.exception("MCP reconnect failed url=%s", url)
+            except BaseException as e:
+                if _is_unreachable_mcp_error(e):
+                    logger.warning(
+                        "MCP unreachable url=%s (connection failed — is the MCP server running?)",
+                        url,
+                    )
+                else:
+                    logger.exception("MCP reconnect failed url=%s", url)
                 return None
         return self._live_sessions.get(url)
 
@@ -173,28 +207,42 @@ class McpToolRuntime:
         if not route:
             return None
         url, mcp_name, extra_headers = route
-        args = arguments or {}
+        args = dict(arguments or {})
         label = "mcp_canvas" if openai_name.startswith("canvas__") else "mcp_google"
+
+        # Always override user_google_email for GWS tools with the authenticated user's
+        # email. The LLM sometimes uses a contact's/recipient's email by mistake.
+        if openai_name.startswith("gws__") and self._gws_user_email:
+            args["user_google_email"] = self._gws_user_email
 
         for attempt in range(2):  # 0 = try existing; 1 = after reconnect
             session = await self._get_or_reconnect(url, extra_headers)
             if session is None:
-                return (
-                    f"MCP connection failed for `{mcp_name}` — server unreachable.",
-                    "mcp_error",
-                )
+                return (_mcp_unreachable_message(url, mcp_name), "mcp_error")
 
             try:
                 result = await session.call_tool(mcp_name, args)
                 return _format_call_tool_result(result), label
-            except Exception:
+            except BaseException as e:
+                if attempt == 0 and _is_unreachable_mcp_error(e):
+                    logger.warning(
+                        "MCP call failed (network) tool=%s — retrying after reconnect",
+                        mcp_name,
+                    )
+                    self._live_sessions.pop(url, None)
+                    continue
                 if attempt == 0:
                     logger.warning(
-                        "MCP session timed out (tool=%s), reconnecting…", mcp_name
+                        "MCP session error (tool=%s), reconnecting…", mcp_name
                     )
-                    # Drop the dead session; next iteration will reconnect
                     self._live_sessions.pop(url, None)
                 else:
+                    if _is_unreachable_mcp_error(e):
+                        logger.warning(
+                            "MCP tool call failed after reconnect (unreachable) tool=%s",
+                            mcp_name,
+                        )
+                        return (_mcp_unreachable_message(url, mcp_name), "mcp_error")
                     logger.exception(
                         "MCP tool call failed after reconnect tool=%s", mcp_name
                     )
@@ -224,6 +272,7 @@ async def build_mcp_runtime(
     canvas_http_headers: dict[str, str] | None = None,
     max_tools: int,
     desc_max_chars: int,
+    gws_user_email: str | None = None,
 ) -> McpToolRuntime | None:
     """
     Connect to each configured MCP server, list tools, and return a runtime.
@@ -248,14 +297,25 @@ async def build_mcp_runtime(
             prefix: str,
             base_url: str,
             extra_headers: dict[str, str] | None = None,
+            server_cap: int | None = None,
         ) -> None:
             nonlocal tools
             try:
                 session = await stack.enter_async_context(
                     _connected_client_session(base_url, extra_headers)
                 )
-            except Exception:
-                logger.exception("MCP connect failed for %s at %s", prefix, base_url)
+            except BaseException as e:
+                if _is_unreachable_mcp_error(e):
+                    logger.warning(
+                        "MCP connect failed (unreachable) for %s at %s — %s",
+                        prefix,
+                        base_url,
+                        _GOOGLE_MCP_HINT
+                        if prefix == "gws"
+                        else "Ensure the MCP server is running and MCP_*_URL matches.",
+                    )
+                else:
+                    logger.exception("MCP connect failed for %s at %s", prefix, base_url)
                 return
             live_sessions[base_url] = session
             try:
@@ -263,10 +323,17 @@ async def build_mcp_runtime(
             except Exception:
                 logger.exception("MCP list_tools failed for %s", prefix)
                 return
+            cap = server_cap if server_cap is not None else max_tools
+            server_registered = 0
             for t in mcp_tools:
-                if len(tools) >= max_tools:
-                    logger.warning("MCP tool list truncated at max_tools=%s", max_tools)
-                    return
+                if server_registered >= cap:
+                    dropped = len(mcp_tools) - server_registered
+                    logger.warning(
+                        "MCP tool cap reached (per-server cap=%d, global max=%d) for server '%s'"
+                        " — %d tool(s) dropped. Raise MCP_MAX_TOOLS env var to expose more tools.",
+                        cap, max_tools, prefix, dropped,
+                    )
+                    break
                 o_name = _openai_tool_name(prefix, t.name)
                 if o_name in routes:
                     o_name = _openai_tool_name(prefix, f"{t.name}_{len(routes)}")
@@ -284,13 +351,20 @@ async def build_mcp_runtime(
                     }
                 )
                 routes[o_name] = (base_url, t.name, extra_headers)
+                server_registered += 1
 
         cu = (canvas_url or "").strip()
         gu = (google_url or "").strip()
+        # Use the full `max_tools` budget across servers in order: Canvas first, then
+        # Google with whatever slots remain. Even splits (64+64) used to drop late-listed
+        # gws tools (e.g. People contacts) when Canvas left budget unused. OpenAI still caps
+        # total function tools (typically 128); keep max_tools within that limit.
+        remaining = max_tools
         if cu:
-            await _ingest("canvas", cu, canvas_http_headers)
+            await _ingest("canvas", cu, canvas_http_headers, remaining)
+            remaining = max(0, max_tools - len(tools))
         if gu:
-            await _ingest("gws", gu, None)
+            await _ingest("gws", gu, None, remaining)
 
     except Exception:
         await _shutdown()
@@ -305,6 +379,7 @@ async def build_mcp_runtime(
         _routes=routes,
         _live_sessions=live_sessions,
         _stack=stack,
+        _gws_user_email=gws_user_email,
     )
     rt._close = _shutdown
     return rt

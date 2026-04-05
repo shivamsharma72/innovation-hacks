@@ -33,15 +33,11 @@ from .tools import (
     register_code_execution_tools,
     register_course_tools,
     register_discovery_tools,
-    register_discussion_tools,
     register_file_tools,
     register_messaging_tools,
     register_module_tools,
     register_other_tools,
     register_page_tools,
-    register_peer_review_comment_tools,
-    register_peer_review_tools,
-    register_rubric_tools,
     register_student_tools,
 )
 
@@ -99,14 +95,10 @@ def register_all_tools(mcp: FastMCP) -> None:
     # Register tools by category
     register_course_tools(mcp)
     register_assignment_tools(mcp)
-    register_discussion_tools(mcp)
     register_file_tools(mcp)
     register_module_tools(mcp)
     register_other_tools(mcp)
     register_page_tools(mcp)
-    register_rubric_tools(mcp)
-    register_peer_review_tools(mcp)
-    register_peer_review_comment_tools(mcp)
     register_messaging_tools(mcp)
     register_student_tools(mcp)
     register_accessibility_tools(mcp)
