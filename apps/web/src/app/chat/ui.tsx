@@ -1,143 +1,188 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { VoiceButton } from "@/components/chat/VoiceButton";
+import { HitlBanner } from "@/components/chat/HitlBanner";
 
 type ChatMessage = { role: "user" | "assistant"; content: string };
 
-type ToolTraceEntry = {
-  round: number;
-  tool: string;
-  arguments_preview: string;
-  source: string;
-  result_preview: string;
+type PendingAction = {
+  id: number;
+  action_type: string;
+  payload_json: string;
+  created_at: string;
 };
 
-export function ChatClient() {
-  const [input, setInput] = useState("");
+interface Props {
+  initialSessionId?: number | null;
+  initialQuery?: string | null;
+}
+
+export function ChatClient({ initialSessionId, initialQuery }: Props) {
+  const [input, setInput] = useState(initialQuery ?? "");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
-  const [sources, setSources] = useState<string[] | null>(null);
-  const [toolTrace, setToolTrace] = useState<ToolTraceEntry[] | null>(null);
+  const [sessionId, setSessionId] = useState<number | null>(initialSessionId ?? null);
+  const [voiceMode, setVoiceMode] = useState(false);
+  const [pendingActions, setPendingActions] = useState<PendingAction[]>([]);
+  const bottomRef = useRef<HTMLDivElement>(null);
 
-  async function send() {
-    const text = input.trim();
+  // Fetch pending HITL actions
+  const refreshHitl = async () => {
+    try {
+      const res = await fetch("/api/gateway/hitl");
+      if (res.ok) {
+        const data = await res.json();
+        setPendingActions(data.items ?? []);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  useEffect(() => {
+    refreshHitl();
+  }, []);
+
+  // Scroll to bottom on new messages
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, loading]);
+
+  const send = async (overrideText?: string) => {
+    const text = (overrideText ?? input).trim();
     if (!text || loading) return;
     setInput("");
     const history = messages;
     setMessages((m) => [...m, { role: "user", content: text }]);
     setLoading(true);
-    setSources(null);
-    setToolTrace(null);
+
     try {
-      const res = await fetch("/api/gateway/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message: text,
-          history,
-        }),
+      const endpoint = voiceMode ? "/api/gateway/voice" : "/api/gateway/chat";
+      const body = JSON.stringify({
+        message: text,
+        history,
+        session_id: sessionId ?? undefined,
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setMessages((m) => [
-          ...m,
-          {
-            role: "assistant",
-            content:
-              typeof data.detail === "string"
-                ? data.detail
-                : "Something went wrong.",
-          },
-        ]);
-        return;
+
+      if (voiceMode) {
+        const res = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body });
+        const replyText = res.headers.get("x-reply-text") || "";
+
+        if (res.ok && res.headers.get("content-type")?.includes("audio")) {
+          // Play audio
+          const blob = await res.blob();
+          const url = URL.createObjectURL(blob);
+          const audio = new Audio(url);
+          audio.play().catch(() => {});
+          setMessages((m) => [...m, { role: "assistant", content: replyText || "(audio response)" }]);
+        } else {
+          // Fallback JSON
+          const data = await res.json().catch(() => ({}));
+          setMessages((m) => [...m, { role: "assistant", content: data.reply_text ?? replyText ?? "No response." }]);
+          if (data.session_id) setSessionId(data.session_id);
+        }
+      } else {
+        const res = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setMessages((m) => [
+            ...m,
+            { role: "assistant", content: typeof data.detail === "string" ? data.detail : "Something went wrong." },
+          ]);
+        } else {
+          setMessages((m) => [...m, { role: "assistant", content: data.reply_text ?? "" }]);
+          if (data.session_id) setSessionId(data.session_id);
+        }
       }
-      setMessages((m) => [
-        ...m,
-        { role: "assistant", content: data.reply_text ?? "" },
-      ]);
-      if (Array.isArray(data.sources)) {
-        setSources(data.sources);
-      }
-      if (Array.isArray(data.tool_trace) && data.tool_trace.length > 0) {
-        setToolTrace(data.tool_trace as ToolTraceEntry[]);
-      }
+
+      // Refresh HITL after each response (a new pending action may have been created)
+      await refreshHitl();
     } catch {
-      setMessages((m) => [
-        ...m,
-        { role: "assistant", content: "Network error." },
-      ]);
+      setMessages((m) => [...m, { role: "assistant", content: "Network error." }]);
     } finally {
       setLoading(false);
     }
-  }
+  };
 
   return (
-    <div className="flex flex-1 flex-col gap-4">
-      <div className="flex-1 space-y-4 overflow-y-auto rounded-xl border border-zinc-800 bg-zinc-950/50 p-4">
+    <div className="flex flex-col flex-1 overflow-hidden">
+      {/* HITL banner */}
+      <HitlBanner items={pendingActions} onResolved={refreshHitl} />
+
+      {/* Messages */}
+      <div className="flex-1 overflow-auto px-4 py-4 space-y-4">
         {messages.length === 0 && (
-          <p className="text-sm text-zinc-500">
-            Try: &quot;What&apos;s my day like?&quot; or &quot;What am I behind
-            on?&quot;
+          <p className="text-sm text-zinc-600 text-center mt-8">
+            Ask me anything about your courses, assignments, calendar, or tasks.
           </p>
         )}
         {messages.map((msg, i) => (
-          <div
-            key={i}
-            className={`text-sm ${msg.role === "user" ? "text-indigo-200" : "text-zinc-200"}`}
-          >
-            <span className="font-medium text-zinc-500">
-              {msg.role === "user" ? "You" : "Assistant"}
-            </span>
-            <p className="mt-1 whitespace-pre-wrap">{msg.content}</p>
+          <div key={i} className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}>
+            <div
+              className={`max-w-[80%] rounded-2xl px-4 py-2.5 text-sm ${
+                msg.role === "user"
+                  ? "bg-indigo-600 text-white rounded-br-sm"
+                  : "bg-zinc-800 text-zinc-200 rounded-bl-sm"
+              }`}
+            >
+              <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
+            </div>
           </div>
         ))}
-        {loading && <p className="text-sm text-zinc-500">Thinking…</p>}
+        {loading && (
+          <div className="flex justify-start">
+            <div className="rounded-2xl rounded-bl-sm bg-zinc-800 px-4 py-3">
+              <span className="flex gap-1">
+                <span className="h-1.5 w-1.5 rounded-full bg-zinc-500 animate-bounce [animation-delay:0ms]" />
+                <span className="h-1.5 w-1.5 rounded-full bg-zinc-500 animate-bounce [animation-delay:150ms]" />
+                <span className="h-1.5 w-1.5 rounded-full bg-zinc-500 animate-bounce [animation-delay:300ms]" />
+              </span>
+            </div>
+          </div>
+        )}
+        <div ref={bottomRef} />
       </div>
-      {sources && sources.length > 0 && (
-        <p className="text-xs text-zinc-500">Sources: {sources.join(", ")}</p>
-      )}
-      {toolTrace && toolTrace.length > 0 && (
-        <details className="rounded-lg border border-zinc-800 bg-zinc-950/80 p-3 text-xs text-zinc-400">
-          <summary className="cursor-pointer font-medium text-zinc-300">
-            Tool trace ({toolTrace.length} calls)
-          </summary>
-          <p className="mt-2 text-zinc-500">
-            One row per tool the model invoked this turn (round = loop step).
-          </p>
-          <ul className="mt-2 space-y-3 font-mono text-[11px] leading-relaxed">
-            {toolTrace.map((t, i) => (
-              <li key={i} className="border-t border-zinc-800 pt-2 first:border-t-0 first:pt-0">
-                <span className="text-indigo-400">
-                  r{t.round} · {t.tool}
-                </span>{" "}
-                <span className="text-zinc-600">({t.source})</span>
-                <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all text-zinc-500">
-                  args: {t.arguments_preview}
-                </pre>
-                <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all text-zinc-500">
-                  → {t.result_preview}
-                </pre>
-              </li>
-            ))}
-          </ul>
-        </details>
-      )}
-      <div className="flex gap-2">
-        <input
-          className="flex-1 rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-indigo-500"
-          placeholder="Message…"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && (e.preventDefault(), void send())}
-        />
-        <button
-          type="button"
-          onClick={() => void send()}
-          disabled={loading}
-          className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
-        >
-          Send
-        </button>
+
+      {/* Input bar */}
+      <div className="border-t border-zinc-800 px-4 py-3">
+        <div className="flex items-center gap-2">
+          <VoiceButton onTranscript={(t) => send(t)} disabled={loading} />
+
+          <button
+            type="button"
+            onClick={() => setVoiceMode((v) => !v)}
+            title={voiceMode ? "Voice mode on — responses will play as audio" : "Enable voice response mode"}
+            className={`flex h-9 w-9 items-center justify-center rounded-lg border text-sm transition-colors ${
+              voiceMode
+                ? "border-indigo-500 bg-indigo-600/20 text-indigo-300"
+                : "border-zinc-700 text-zinc-500 hover:border-zinc-500"
+            }`}
+          >
+            🔊
+          </button>
+
+          <input
+            className="flex-1 rounded-xl border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm text-zinc-200 placeholder-zinc-600 outline-none focus:border-indigo-500 transition-colors"
+            placeholder="Message…"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && (e.preventDefault(), void send())}
+            disabled={loading}
+          />
+
+          <button
+            type="button"
+            onClick={() => void send()}
+            disabled={loading || !input.trim()}
+            className="rounded-xl bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-40 transition-colors"
+          >
+            Send
+          </button>
+        </div>
+        {sessionId && (
+          <p className="mt-1.5 text-[10px] text-zinc-700 pl-1">Session #{sessionId}</p>
+        )}
       </div>
     </div>
   );

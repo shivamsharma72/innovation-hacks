@@ -1,7 +1,9 @@
 """
 Streamable-HTTP MCP client: list tools and dispatch calls for the OpenAI tool loop.
 
-Sessions stay open for the duration of one `run_agent_conversation` call.
+Sessions are established at startup and reused across tool calls. If a session
+times out between LLM rounds (GWS MCP has a ~10 s idle timeout), dispatch_mcp
+reconnects transparently and retries the tool call once.
 """
 
 from __future__ import annotations
@@ -20,7 +22,6 @@ from mcp.shared._httpx_utils import create_mcp_http_client
 
 logger = logging.getLogger(__name__)
 
-# OpenAI function names: conservative charset and length
 _OPENAI_NAME_MAX = 64
 _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 
@@ -57,13 +58,9 @@ def _format_call_tool_result(result: mcp_types.CallToolResult) -> str:
         if block.type == "text":
             lines.append(block.text)
         elif block.type == "image":
-            lines.append(
-                f"[image omitted: mime={block.mimeType}, bytes~{len(block.data)}]"
-            )
+            lines.append(f"[image omitted: mime={block.mimeType}, bytes~{len(block.data)}]")
         elif block.type == "audio":
-            lines.append(
-                f"[audio omitted: mime={block.mimeType}, bytes~{len(block.data)}]"
-            )
+            lines.append(f"[audio omitted: mime={block.mimeType}, bytes~{len(block.data)}]")
         elif block.type == "resource_link":
             lines.append(f"[resource: {block.uri}]")
         elif block.type == "resource":
@@ -85,10 +82,7 @@ def _format_call_tool_result(result: mcp_types.CallToolResult) -> str:
             blob = blob[:12_000] + "…(truncated)"
         lines.append(blob)
 
-    if result.isError:
-        prefix = "MCP tool error: "
-    else:
-        prefix = ""
+    prefix = "MCP tool error: " if result.isError else ""
     body = "\n".join(lines) if lines else "(empty MCP tool result)"
     return prefix + body
 
@@ -97,15 +91,13 @@ async def _list_all_tools(session: ClientSession) -> list[mcp_types.Tool]:
     tools: list[mcp_types.Tool] = []
     cursor: str | None = None
     while True:
-        params = (
-            mcp_types.PaginatedRequestParams(cursor=cursor) if cursor else None
-        )
+        params = mcp_types.PaginatedRequestParams(cursor=cursor) if cursor else None
         res = await session.list_tools(params=params)
         tools.extend(res.tools)
         nxt = res.nextCursor
         if nxt is None:
             break
-        cursor = str(nxt) if nxt is not None else None
+        cursor = str(nxt)
     return tools
 
 
@@ -114,7 +106,7 @@ async def _connected_client_session(
     url: str,
     extra_headers: dict[str, str] | None = None,
 ):
-    """Open MCP streamable-http session. Optional headers (e.g. X-Canvas-*) attach to every request."""
+    """Open one MCP streamable-HTTP session, yield it, then clean up."""
     client = create_mcp_http_client(headers=extra_headers)
     async with client:
         async with streamable_http_client(url, http_client=client) as (
@@ -127,31 +119,102 @@ async def _connected_client_session(
                 yield session
 
 
+# openai_name → (server_url, mcp_tool_name, extra_headers)
+_RouteEntry = tuple[str, str, dict[str, str] | None]
+
+
 @dataclass
 class McpToolRuntime:
-    """Holds OpenAI tool definitions and routes tool calls to MCP sessions."""
+    """
+    Holds tool definitions and routes calls to MCP sessions.
+
+    Sessions are established at build time and cached in ``_live_sessions``.
+    If a session dies (server-side idle timeout), ``dispatch_mcp`` reconnects
+    once and retries transparently — the LLM never sees the dead session.
+    """
 
     tools: list[dict[str, Any]]
-    _routes: dict[str, tuple[ClientSession, str]] = field(default_factory=dict)
+    # openai_name → (url, mcp_tool_name, extra_headers)
+    _routes: dict[str, _RouteEntry] = field(default_factory=dict)
+    # url → currently live ClientSession
+    _live_sessions: dict[str, ClientSession] = field(default_factory=dict)
     _stack: AsyncExitStack | None = None
     _close: Callable[[], Awaitable[None]] | None = None
 
-    async def dispatch_mcp(self, openai_name: str, arguments: dict[str, Any] | None):
+    async def _get_or_reconnect(self, url: str, extra_headers: dict[str, str] | None) -> ClientSession | None:
+        """Return the live session for *url*, creating a new one if needed."""
+        if url not in self._live_sessions:
+            if self._stack is None:
+                return None
+            try:
+                session = await self._stack.enter_async_context(
+                    _connected_client_session(url, extra_headers)
+                )
+                self._live_sessions[url] = session
+                logger.info("MCP reconnected url=%s", url)
+            except Exception:
+                logger.exception("MCP reconnect failed url=%s", url)
+                return None
+        return self._live_sessions.get(url)
+
+    async def send_keepalive(self) -> None:
+        """Ping all live sessions to prevent server-side idle timeout."""
+        for url, session in list(self._live_sessions.items()):
+            try:
+                await session.send_ping()
+                logger.debug("MCP keepalive ping sent url=%s", url)
+            except Exception:
+                logger.debug("MCP keepalive ping failed url=%s (will reconnect on next call)", url)
+
+    async def dispatch_mcp(
+        self, openai_name: str, arguments: dict[str, Any] | None
+    ) -> tuple[str, str] | None:
         route = self._routes.get(openai_name)
         if not route:
             return None
-        session, mcp_name = route
+        url, mcp_name, extra_headers = route
         args = arguments or {}
-        result = await session.call_tool(mcp_name, args)
-        text = _format_call_tool_result(result)
         label = "mcp_canvas" if openai_name.startswith("canvas__") else "mcp_google"
-        return text, label
+
+        for attempt in range(2):  # 0 = try existing; 1 = after reconnect
+            session = await self._get_or_reconnect(url, extra_headers)
+            if session is None:
+                return (
+                    f"MCP connection failed for `{mcp_name}` — server unreachable.",
+                    "mcp_error",
+                )
+
+            try:
+                result = await session.call_tool(mcp_name, args)
+                return _format_call_tool_result(result), label
+            except Exception:
+                if attempt == 0:
+                    logger.warning(
+                        "MCP session timed out (tool=%s), reconnecting…", mcp_name
+                    )
+                    # Drop the dead session; next iteration will reconnect
+                    self._live_sessions.pop(url, None)
+                else:
+                    logger.exception(
+                        "MCP tool call failed after reconnect tool=%s", mcp_name
+                    )
+                    return (
+                        f"MCP tool call failed for `{mcp_name}` after reconnect. "
+                        "The MCP server may be unavailable.",
+                        "mcp_error",
+                    )
+
+        return ("MCP call unreachable", "mcp_error")  # should never reach here
 
     async def aclose(self) -> None:
         if self._close:
-            await self._close()
+            try:
+                await self._close()
+            except Exception:
+                logger.debug("MCP stack close raised (likely dead sessions)", exc_info=True)
             self._close = None
         self._stack = None
+        self._live_sessions.clear()
 
 
 async def build_mcp_runtime(
@@ -162,20 +225,25 @@ async def build_mcp_runtime(
     max_tools: int,
     desc_max_chars: int,
 ) -> McpToolRuntime | None:
-    """Connect to configured MCP servers and merge tool lists (capped).
+    """
+    Connect to each configured MCP server, list tools, and return a runtime.
 
-    Returns None if no server could be reached or no tools were registered.
+    The initial sessions are kept alive in an AsyncExitStack. If a session
+    times out later (server-side idle), dispatch_mcp reconnects automatically.
     """
     tools: list[dict[str, Any]] = []
-    routes: dict[str, tuple[ClientSession, str]] = {}
+    routes: dict[str, _RouteEntry] = {}
+    live_sessions: dict[str, ClientSession] = {}
     stack = AsyncExitStack()
     await stack.__aenter__()
 
-    async def _shutdown():
-        await stack.aclose()
+    async def _shutdown() -> None:
+        try:
+            await stack.aclose()
+        except Exception:
+            logger.debug("MCP stack shutdown raised", exc_info=True)
 
     try:
-
         async def _ingest(
             prefix: str,
             base_url: str,
@@ -189,16 +257,15 @@ async def build_mcp_runtime(
             except Exception:
                 logger.exception("MCP connect failed for %s at %s", prefix, base_url)
                 return
+            live_sessions[base_url] = session
             try:
                 mcp_tools = await _list_all_tools(session)
             except Exception:
-                logger.exception("MCP tools/list failed for %s", prefix)
+                logger.exception("MCP list_tools failed for %s", prefix)
                 return
             for t in mcp_tools:
                 if len(tools) >= max_tools:
-                    logger.warning(
-                        "MCP tool list truncated at max_tools=%s", max_tools
-                    )
+                    logger.warning("MCP tool list truncated at max_tools=%s", max_tools)
                     return
                 o_name = _openai_tool_name(prefix, t.name)
                 if o_name in routes:
@@ -211,13 +278,12 @@ async def build_mcp_runtime(
                         "type": "function",
                         "function": {
                             "name": o_name,
-                            "description": desc
-                            or f"MCP tool `{t.name}` from {prefix} server.",
+                            "description": desc or f"MCP tool `{t.name}` from {prefix} server.",
                             "parameters": _normalize_parameters(t.inputSchema),
                         },
                     }
                 )
-                routes[o_name] = (session, t.name)
+                routes[o_name] = (base_url, t.name, extra_headers)
 
         cu = (canvas_url or "").strip()
         gu = (google_url or "").strip()
@@ -225,14 +291,20 @@ async def build_mcp_runtime(
             await _ingest("canvas", cu, canvas_http_headers)
         if gu:
             await _ingest("gws", gu, None)
+
     except Exception:
-        await stack.aclose()
+        await _shutdown()
         raise
 
     if not routes:
-        await stack.aclose()
+        await _shutdown()
         return None
 
-    rt = McpToolRuntime(tools=tools, _routes=routes, _stack=stack)
+    rt = McpToolRuntime(
+        tools=tools,
+        _routes=routes,
+        _live_sessions=live_sessions,
+        _stack=stack,
+    )
     rt._close = _shutdown
     return rt

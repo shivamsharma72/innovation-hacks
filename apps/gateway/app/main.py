@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.db import init_db
-from app.routers import chat, health, hitl, me
+from app.routers import chat, health, hitl, me, dashboard, tasks, history, voice
 
 logger = logging.getLogger(__name__)
 
@@ -45,3 +45,7 @@ app.include_router(health.router)
 app.include_router(me.router)
 app.include_router(chat.router)
 app.include_router(hitl.router)
+app.include_router(dashboard.router)
+app.include_router(tasks.router)
+app.include_router(history.router)
+app.include_router(voice.router)

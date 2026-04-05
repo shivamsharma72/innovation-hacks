@@ -1,4 +1,5 @@
-from typing import Literal
+from datetime import datetime
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -11,7 +12,7 @@ from app.config import get_settings
 from app.crypto_util import decrypt_secret
 from app.db import get_db
 from app.agent.graph import run_readonly_agent
-from app.models import CanvasCredential, User
+from app.models import CanvasCredential, ChatMessage, ChatSession, User
 from app.services.users import get_or_create_user
 
 router = APIRouter(tags=["chat"])
@@ -24,9 +25,8 @@ class ChatHistoryItem(BaseModel):
 
 class ChatBody(BaseModel):
     message: str = Field(..., min_length=1, max_length=8000)
-    """Prior turns so follow-ups like \"send it\" keep context (user + assistant only)."""
-
     history: list[ChatHistoryItem] = Field(default_factory=list, max_length=40)
+    session_id: Optional[int] = None
 
 
 @router.post("/chat")
@@ -76,22 +76,70 @@ async def chat(
             "Invalid Canvas domain on file.",
         )
 
-    history_payload = [
+    # --- Chat session / history persistence ---
+    chat_session: ChatSession | None = None
+    server_history: list[dict] | None = None
+
+    if body.session_id:
+        # Load existing session (ownership check)
+        sess_result = await session.execute(
+            select(ChatSession).where(
+                ChatSession.id == body.session_id,
+                ChatSession.user_id == user.id,
+            )
+        )
+        chat_session = sess_result.scalar_one_or_none()
+        if chat_session:
+            msgs_result = await session.execute(
+                select(ChatMessage)
+                .where(ChatMessage.session_id == chat_session.id)
+                .order_by(ChatMessage.created_at.asc())
+            )
+            server_history = [
+                {"role": m.role, "content": m.content}
+                for m in msgs_result.scalars().all()
+            ]
+
+    if not chat_session:
+        # Create new session titled from first 80 chars of message
+        chat_session = ChatSession(
+            user_id=user.id,
+            title=body.message.strip()[:80],
+        )
+        session.add(chat_session)
+        await session.flush()  # get the id
+
+    history_payload = server_history if server_history is not None else [
         {"role": h.role, "content": h.content} for h in body.history
     ]
+
     out = await run_readonly_agent(
         {
             "auth0_sub": sub,
             "user_id": user.id,
+            "session_id": chat_session.id,
             "message": body.message.strip(),
             "history": history_payload,
             "canvas_mcp_headers": canvas_hdrs,
+            "db_session": session,
+            "user_email": payload.get("email") or "",
         }
     )
-    payload: dict = {
-        "reply_text": out.get("reply_text", ""),
+
+    reply_text: str = out.get("reply_text", "")
+
+    # Persist the two new messages
+    session.add(ChatMessage(session_id=chat_session.id, role="user", content=body.message.strip()))
+    session.add(ChatMessage(session_id=chat_session.id, role="assistant", content=reply_text))
+    chat_session.last_message_at = datetime.utcnow()
+    session.add(chat_session)
+    await session.commit()
+
+    response_payload: dict = {
+        "reply_text": reply_text,
         "sources": out.get("sources", []),
+        "session_id": chat_session.id,
     }
     if settings.chat_include_tool_trace:
-        payload["tool_trace"] = out.get("tool_trace") or []
-    return payload
+        response_payload["tool_trace"] = out.get("tool_trace") or []
+    return response_payload

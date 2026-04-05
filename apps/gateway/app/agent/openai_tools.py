@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 from openai import AsyncOpenAI
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.canvas_mcp_util import mcp_canvas_request_headers
 from app.config import Settings, get_settings
@@ -13,6 +14,56 @@ logger = logging.getLogger(__name__)
 
 _TRACE_ARGS_MAX = 800
 _TRACE_RESULT_MAX = 600
+
+# Human-readable labels for tool calls shown in the voice UI
+TOOL_DISPLAY_LABELS: dict[str, str] = {
+    # Canvas
+    "canvas__list_courses":         "Checking your Canvas courses",
+    "canvas__get_course":           "Reading course details",
+    "canvas__list_assignments":     "Looking up assignments",
+    "canvas__get_assignment":       "Reading assignment details",
+    "canvas__list_submissions":     "Checking your submissions",
+    "canvas__get_submission":       "Reading a submission",
+    "canvas__list_announcements":   "Reading course announcements",
+    "canvas__list_discussions":     "Checking discussions",
+    "canvas__get_discussion":       "Reading discussion thread",
+    "canvas__list_modules":         "Checking course modules",
+    "canvas__list_pages":           "Reading course pages",
+    "canvas__list_quizzes":         "Checking quizzes",
+    "canvas__list_files":           "Browsing course files",
+    "canvas__list_calendar_events": "Reading Canvas calendar",
+    "canvas__list_todo_items":      "Checking Canvas to-do reminders",
+    "canvas__get_my_todo_items":    "Checking Canvas to-do reminders",
+    "canvas__get_my_peer_reviews_todo": "Checking Canvas peer reviews",
+    "canvas__list_groups":          "Looking up course groups",
+    "canvas__get_grades":           "Checking your grades",
+    # GWS — Gmail
+    "gws__list_messages":           "Reading your emails",
+    "gws__get_message":             "Opening an email",
+    "gws__send_gmail_message":      "Preparing to send email",
+    "gws__search_messages":         "Searching your inbox",
+    "gws__create_draft":            "Drafting an email",
+    # GWS — Calendar
+    "gws__list_events":             "Reading your calendar",
+    "gws__get_event":               "Opening a calendar event",
+    "gws__manage_event":            "Updating your calendar",
+    # GWS — Tasks
+    "gws__list_tasks":              "Checking your tasks",
+    "gws__manage_task":             "Updating tasks",
+    "gws__list_task_lists":         "Reading task lists",
+    # GWS — Drive / Docs / Sheets
+    "gws__list_files":              "Browsing your Google Drive",
+    "gws__get_file":                "Reading a Drive file",
+    "gws__search_files":            "Searching Google Drive",
+    "gws__create_file":             "Creating a document",
+    "gws__update_file":             "Updating a document",
+    "gws__read_document":           "Reading a Google Doc",
+    "gws__update_document":         "Editing a Google Doc",
+    "gws__read_spreadsheet":        "Reading a spreadsheet",
+    # GWS — Contacts
+    "gws__search_contacts":         "Looking up contacts",
+    "gws__list_contacts":           "Reading your contacts",
+}
 
 
 _AUTH_SNIPPET_MAX = 650
@@ -32,9 +83,7 @@ _AUTH_FAILURE_MARKERS = (
     "token expired",
     "refresh token",
     "revoked",
-    "401",
     "403 forbidden",
-    "403",
     "invalid access token",
 )
 
@@ -112,6 +161,11 @@ async def run_agent_conversation(
     *,
     history: list[dict[str, str]] | None = None,
     canvas_mcp_headers: dict[str, str] | None = None,
+    user_id: int | None = None,
+    user_email: str | None = None,  # Auth0 email → injected as user_google_email for gws__ tools
+    db_session: AsyncSession | None = None,
+    tool_prefix_filter: str | None = None,
+    status_callback: Any | None = None,  # called with {type, tool, label} on each tool call
 ) -> tuple[str, list[str], list[dict[str, Any]]]:
     settings = get_settings()
     if not settings.openai_api_key:
@@ -133,6 +187,7 @@ async def run_agent_conversation(
         )
 
     mcp_runtime = None
+    _keepalive_task: asyncio.Task | None = None
     if canvas_mcp or gws_mcp:
         try:
             mcp_runtime = await build_mcp_runtime(
@@ -148,7 +203,23 @@ async def run_agent_conversation(
             )
             mcp_runtime = None
 
-    tools = list(mcp_runtime.tools) if mcp_runtime else []
+    # Keep MCP sessions alive while the LLM is thinking (GWS MCP has a ~10 s idle timeout).
+    # Pings are sent every 5 s so the session never goes idle between tool calls.
+    if mcp_runtime:
+        async def _keepalive_loop():
+            while True:
+                await asyncio.sleep(5)
+                await mcp_runtime.send_keepalive()   # type: ignore[union-attr]
+        _keepalive_task = asyncio.create_task(_keepalive_loop())
+
+    all_tools = list(mcp_runtime.tools) if mcp_runtime else []
+
+    # Apply tool prefix filter for parallel agent sub-loops
+    if tool_prefix_filter and all_tools:
+        tools = [t for t in all_tools if t["function"]["name"].startswith(tool_prefix_filter)]
+    else:
+        tools = all_tools
+
     if not tools:
         hint = []
         if not canvas_mcp and not gws_mcp:
@@ -190,13 +261,52 @@ async def run_agent_conversation(
         "You receive prior user/assistant turns: use them for follow-ups "
         "(e.g. \"send it\" = send the email already drafted) without re-asking for details. "
         "If any tool result clearly indicates OAuth, login, or authentication failure, "
-        "explain that once and stop—do not call the same failing tool repeatedly."
+        "explain that once and stop—do not call the same failing tool repeatedly. "
+        "IMPORTANT — to-do list vs Canvas todos: "
+        "canvas__get_my_todo_items / canvas__list_todo_items shows upcoming Canvas ASSIGNMENT reminders — "
+        "it is READ-ONLY and you CANNOT add items to it. "
+        "When the user says 'add to my to-do list', 'add a task', 'add a reminder', or similar, "
+        "they mean Google Tasks. Use gws__manage_task with action='create', "
+        "task_list_id='@default', and the title the user specified. "
+        "Do NOT call canvas__get_my_todo_items when adding tasks. "
+        "Do NOT loop — if gws__manage_task with action=create succeeds or returns [HITL_PENDING], stop immediately. "
+        "If a tool result contains [HITL_PENDING:...], tell the user: "
+        "'I've queued this action — click the amber notification in the sidebar to approve it.' "
+        "Do NOT say you are unable to perform the action."
     )
     if canvas_mcp and not mcp_has_canvas:
         system += (
             " Note: MCP_CANVAS_URL is configured but no canvas__ tools were registered—"
             "Canvas MCP may have failed to connect; say Canvas MCP is unavailable."
         )
+
+    # Inject the authenticated user's Google email so gws__ tools receive user_google_email.
+    # This is REQUIRED in OAuth 2.0 mode — every gws__ tool call must include it.
+    if user_email:
+        system += (
+            f"\n\nAUTHENTICATED USER EMAIL: {user_email}\n"
+            f"CRITICAL: Every gws__* tool call MUST include user_google_email=\"{user_email}\" "
+            "as a parameter. Never omit it or use a placeholder.\n"
+            f"GOOGLE TASKS: To create a task use ONLY gws__manage_task with EXACTLY these params: "
+            f'action="create", task_list_id="@default", title="<task title>", user_google_email="{user_email}". '
+            "Do NOT call list_task_lists first. Do NOT call manage_drive_access or any other tool. "
+            "task_list_id='@default' is always valid — never change it."
+        )
+
+    # Inject user memory context into system prompt
+    if db_session and user_id:
+        try:
+            from app.memory import read_memory
+            memory_str = await read_memory(db_session, user_id)
+            if memory_str:
+                system += f"\n\n{memory_str}"
+        except Exception:
+            logger.debug("Failed to read user memory", exc_info=True)
+
+    # HITL write-tool list
+    hitl_tools: set[str] = set()
+    if db_session and user_id:
+        hitl_tools = {t.strip() for t in settings.hitl_write_tools.split(",") if t.strip()}
 
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system},
@@ -205,8 +315,10 @@ async def run_agent_conversation(
     ]
     sources: list[str] = []
     tool_trace: list[dict[str, Any]] = []
-    max_rounds = max(4, min(64, settings.openai_max_tool_rounds))
+    # Cap at 8 for voice (fast responses); config can raise it for text chat
+    max_rounds = max(4, min(8, settings.openai_max_tool_rounds))
 
+    _final_reply: str = ""
     try:
         for round_idx in range(max_rounds):
             resp = await client.chat.completions.create(
@@ -239,6 +351,41 @@ async def run_agent_conversation(
                 async def _run_tool_call(
                     tool_name: str, args_obj: dict[str, Any]
                 ) -> tuple[str, str]:
+                    # Notify caller (e.g. voice SSE stream) of in-progress tool call
+                    if status_callback:
+                        label = TOOL_DISPLAY_LABELS.get(
+                            tool_name,
+                            "Using " + tool_name.replace("canvas__", "").replace("gws__", "").replace("_", " "),
+                        )
+                        try:
+                            status_callback({"type": "tool_call", "tool": tool_name, "label": label})
+                        except Exception:
+                            pass
+
+                    # HITL: intercept write tools — queue for user approval instead of executing
+                    if hitl_tools and tool_name in hitl_tools and db_session and user_id:
+                        try:
+                            from app.models import PendingAction
+                            from app.db import session_factory as _sf
+                            import json as _json
+                            async with _sf()() as _s:
+                                action = PendingAction(
+                                    user_id=user_id,
+                                    action_type=tool_name,
+                                    payload_json=_json.dumps(args_obj),
+                                )
+                                _s.add(action)
+                                await _s.commit()
+                                await _s.refresh(action)
+                                action_id = action.id
+                            return (
+                                f"[HITL_PENDING:{action_id}] This action requires your approval before execution. "
+                                "Please check the pending actions panel in the UI to approve or reject.",
+                                "hitl_pending",
+                            )
+                        except Exception:
+                            logger.exception("HITL intercept failed for %s", tool_name)
+
                     if mcp_runtime and (
                         tool_name.startswith("canvas__")
                         or tool_name.startswith("gws__")
@@ -322,17 +469,29 @@ async def run_agent_conversation(
                 continue
 
             text = (msg.content or "").strip()
-            return (
-                text or "(empty model response)",
-                sources,
-                tool_trace,
-            )
+            _final_reply = text or "(empty model response)"
+            return (_final_reply, sources, tool_trace)
 
-        return (
-            "Too many tool rounds — try a shorter request or fewer actions at once.",
-            sources,
-            tool_trace,
-        )
+        _final_reply = "Too many tool rounds — try a shorter request or fewer actions at once."
+        return (_final_reply, sources, tool_trace)
     finally:
+        # Cancel keepalive before closing sessions
+        if _keepalive_task:
+            _keepalive_task.cancel()
+            try:
+                await _keepalive_task
+            except asyncio.CancelledError:
+                pass
         if mcp_runtime:
             await mcp_runtime.aclose()
+        # Fire-and-forget memory write (never blocks the response)
+        if db_session and user_id and _final_reply and tool_trace:
+            try:
+                from app.db import session_factory as _sf
+                from app.memory import write_memory
+                convo = f"User: {user_message}\nAssistant: {_final_reply}"
+                asyncio.create_task(
+                    write_memory(_sf(), user_id, convo, AsyncOpenAI(api_key=settings.openai_api_key), settings.openai_model)
+                )
+            except Exception:
+                pass

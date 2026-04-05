@@ -47,6 +47,15 @@ class Settings(BaseSettings):
     # Include per-request tool call trace in POST /chat JSON (dev / debugging).
     chat_include_tool_trace: bool = False
 
+    # ElevenLabs TTS
+    elevenlabs_api_key: str = ""
+    elevenlabs_voice_id: str = "JBFqnCBsd6RMkjVDRZzb"  # default: George
+
+    # Comma-separated OpenAI tool names that require HITL approval before execution.
+    # Only truly irreversible actions (send email, delete events) need approval.
+    # Task create/update is non-destructive so it is NOT gated by default.
+    hitl_write_tools: str = "gws__send_gmail_message"
+
 
 @lru_cache
 def get_settings() -> Settings:

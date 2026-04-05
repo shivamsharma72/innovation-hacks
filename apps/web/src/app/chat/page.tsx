@@ -1,23 +1,23 @@
-import Link from "next/link";
 import { redirect } from "next/navigation";
 import { auth0 } from "@/lib/auth0";
+import AppLayout from "@/components/layout/AppLayout";
 import { ChatClient } from "./ui";
 
-export default async function ChatPage() {
+export default async function ChatPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ q?: string; session_id?: string }>;
+}) {
   const session = await auth0.getSession();
-  if (!session) {
-    redirect("/auth/login");
-  }
+  if (!session) redirect("/auth/login");
+
+  const params = await searchParams;
+  const initialQuery = params.q ?? null;
+  const initialSessionId = params.session_id ? parseInt(params.session_id, 10) : null;
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-2xl flex-col px-4 py-8">
-      <header className="mb-6 flex items-center justify-between">
-        <Link href="/" className="text-sm text-zinc-500 hover:text-zinc-300">
-          ← Home
-        </Link>
-        <span className="truncate text-sm text-zinc-500">{session.user.email}</span>
-      </header>
-      <ChatClient />
-    </main>
+    <AppLayout>
+      <ChatClient initialSessionId={initialSessionId} initialQuery={initialQuery} />
+    </AppLayout>
   );
 }
